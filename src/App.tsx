@@ -12,6 +12,7 @@ import { ClinicalReport } from './components/ClinicalReport';
 import { PatientsScreen } from './components/PatientsScreen';
 import { PatientInfoScreen } from './components/PatientInfoScreen';
 import { AgendaScreen } from './components/AgendaScreen';
+import { BillingScreen } from './components/BillingScreen';
 import { getSupabaseClient, supabaseConfigError } from './supabaseClient';
 import { BODY_REGIONS } from './mockData';
 import { normalizeText, packPatientNotes } from './patientUtils';
@@ -39,7 +40,10 @@ function loadGeminiConfig(): GeminiConfig {
   return { ...stored, apiKey: stored.apiKey || DEFAULT_GEMINI.apiKey };
 }
 
-const DEFAULT_PROFESSIONALS = ['Fisio: Luis', 'Fisio: Carlos'];
+interface Physiotherapist {
+  id: string;
+  name: string;
+}
 
 const DEFAULT_ANAMNESIS = {
   que: '',
@@ -73,10 +77,37 @@ function isMissingEpisodeClosureColumns(error: unknown): boolean {
     /closed_at|discharge_reason|discharge_notes/i.test(message);
 }
 
+async function addLatestSessionActivity(episodes: Episode[]): Promise<Episode[]> {
+  if (episodes.length === 0) return episodes;
+  const { data, error } = await getSupabaseClient()
+    .from('sessions')
+    .select('episode_id,date,created_at')
+    .in('episode_id', episodes.map((episode) => episode.id));
+  if (error) throw error;
+
+  const latestActivityByEpisode = new Map<string, string>();
+  for (const row of data ?? []) {
+    const episodeId = String(row.episode_id ?? '');
+    const activityDates = [row.date, row.created_at]
+      .filter((value): value is string => typeof value === 'string')
+      .filter((value) => !Number.isNaN(new Date(value).getTime()));
+    const latestActivity = activityDates.sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0];
+    const existingActivity = latestActivityByEpisode.get(episodeId);
+    if (latestActivity && (!existingActivity || new Date(latestActivity) > new Date(existingActivity))) {
+      latestActivityByEpisode.set(episodeId, latestActivity);
+    }
+  }
+  return episodes.map((episode) => ({
+    ...episode,
+    latestSessionAt: latestActivityByEpisode.get(episode.id),
+  }));
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('pacientes');
-  const [professionals, setProfessionals] = useState<string[]>(DEFAULT_PROFESSIONALS);
+  const [professionals, setProfessionals] = useState<Physiotherapist[]>([]);
   const [selectedPhysio, setSelectedPhysio] = useState<string>('Fisio: Luis');
+  const [professionalError, setProfessionalError] = useState<string | null>(null);
   const [equipment, setEquipment] = useState<Record<EquipmentKey, boolean>>(DEFAULT_EQUIPMENT);
   const [geminiConfig, setGeminiConfig] = useState<GeminiConfig>(loadGeminiConfig);
   const [sessions, setSessions] = useState<SessionEntry[]>([]);
@@ -97,6 +128,32 @@ export default function App() {
   const [autoNamedEpisodeId, setAutoNamedEpisodeId] = useState<string | null>(null);
 
   useEffect(() => {
+    let isMounted = true;
+    const loadProfessionals = async () => {
+      const { data, error } = await getSupabaseClient()
+        .from('physiotherapists')
+        .select('id, name')
+        .eq('is_active', true)
+        .order('name');
+      if (error) {
+        if (isMounted) setProfessionalError(`No se pudieron cargar los fisioterapeutas: ${error.message}`);
+        return;
+      }
+      if (!isMounted) return;
+      const loadedProfessionals = (data ?? []).map((professional: { id: string; name: string }) => ({
+        id: String(professional.id),
+        name: String(professional.name),
+      }));
+      setProfessionals(loadedProfessionals);
+      setSelectedPhysio((current) => loadedProfessionals.some((professional) => `Fisio: ${professional.name}` === current)
+        ? current
+        : loadedProfessionals[0] ? `Fisio: ${loadedProfessionals[0].name}` : '');
+    };
+    void loadProfessionals();
+    return () => { isMounted = false; };
+  }, []);
+
+  useEffect(() => {
     saveToStorage('fisiocopilot_patients', patients);
   }, [patients]);
 
@@ -109,32 +166,30 @@ export default function App() {
       'fisiocopilot_episode_closures',
       {},
     );
-    const { data } = await getSupabaseClient()
+    const { data, error } = await getSupabaseClient()
       .from('episodes')
       .select('*')
       .eq('patient_id', patientId)
       .order('created_at', { ascending: true });
-    if (data) {
-      const mapped: Episode[] = data.map((e: Record<string, unknown>) => {
-        return {
-          id: String(e.id),
-          patientId: String(e.patient_id ?? e.patientId ?? ''),
-          title: String(e.title ?? ''),
-          region: (e.region as string | null) ?? null,
-          anamnesis: (e.anamnesis as Episode['anamnesis']) ?? null,
-          status: (e.status as 'active' | 'resolved') ?? 'active',
-          createdAt: String(e.created_at ?? e.createdAt ?? ''),
-          closedAt: (e.closed_at as string | undefined) ?? cachedClosureData[String(e.id)]?.closedAt,
-          dischargeReason: (e.discharge_reason as Episode['dischargeReason']) ?? cachedClosureData[String(e.id)]?.dischargeReason,
-          dischargeNotes: (e.discharge_notes as string | undefined) ?? cachedClosureData[String(e.id)]?.dischargeNotes,
-          notes: (e.notes as string | undefined) ?? '',
-        };
-      });
-      setEpisodes(mapped);
-      return mapped;
-    }
-    setEpisodes([]);
-    return [];
+    if (error) throw error;
+    const mapped: Episode[] = (data ?? []).map((e: Record<string, unknown>) => ({
+      id: String(e.id),
+      patientId: String(e.patient_id ?? e.patientId ?? ''),
+      title: String(e.title ?? ''),
+      region: (e.region as string | null) ?? null,
+      anamnesis: (e.anamnesis as Episode['anamnesis']) ?? null,
+      status: (e.status as Episode['status']) ?? 'active',
+      createdAt: String(e.created_at ?? e.createdAt ?? ''),
+      updatedAt: typeof e.updated_at === 'string' ? e.updated_at : undefined,
+      isClosed: typeof e.is_closed === 'boolean' ? e.is_closed : undefined,
+      closedAt: (e.closed_at as string | undefined) ?? cachedClosureData[String(e.id)]?.closedAt,
+      dischargeReason: (e.discharge_reason as Episode['dischargeReason']) ?? cachedClosureData[String(e.id)]?.dischargeReason,
+      dischargeNotes: (e.discharge_notes as string | undefined) ?? cachedClosureData[String(e.id)]?.dischargeNotes,
+      notes: (e.notes as string | undefined) ?? '',
+    }));
+    const episodesWithActivity = await addLatestSessionActivity(mapped);
+    setEpisodes(episodesWithActivity);
+    return episodesWithActivity;
   }, []);
 
   const handleDeleteEpisode = useCallback(async (episodeId: string) => {
@@ -274,10 +329,46 @@ export default function App() {
     }
   }, [activeTab, activeEpisodeId, loadSessionsForEpisode]);
 
-  const handleAddProfessional = (name: string) => {
-    const formatted = `Fisio: ${name}`;
-    setProfessionals((prev) => [...prev, formatted]);
-    setSelectedPhysio(formatted);
+  const handleAddProfessional = async (name: string) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    setProfessionalError(null);
+    const { data, error } = await getSupabaseClient()
+      .from('physiotherapists')
+      .insert([{ name: trimmedName }])
+      .select('id, name')
+      .single();
+    if (error) {
+      setProfessionalError(`No se pudo añadir el fisioterapeuta: ${error.message}`);
+      throw error;
+    }
+    if (!data) {
+      const errorMessage = 'Supabase no devolvió el fisioterapeuta creado.';
+      setProfessionalError(errorMessage);
+      throw new Error(errorMessage);
+    }
+    const professional = { id: String(data.id), name: String(data.name) };
+    setProfessionals((previous) => [...previous, professional].sort((a, b) => a.name.localeCompare(b.name, 'es')));
+    setSelectedPhysio(`Fisio: ${professional.name}`);
+  };
+
+  const handleDeleteProfessional = async (professionalId: string) => {
+    setProfessionalError(null);
+    const professionalToDelete = professionals.find((professional) => professional.id === professionalId);
+    if (!professionalToDelete) return;
+    const { error } = await getSupabaseClient()
+      .from('physiotherapists')
+      .update({ is_active: false })
+      .eq('id', professionalId);
+    if (error) {
+      setProfessionalError(`No se pudo eliminar el fisioterapeuta: ${error.message}`);
+      throw error;
+    }
+    const remainingProfessionals = professionals.filter((professional) => professional.id !== professionalId);
+    setProfessionals(remainingProfessionals);
+    if (selectedPhysio === `Fisio: ${professionalToDelete.name}`) {
+      setSelectedPhysio(remainingProfessionals[0] ? `Fisio: ${remainingProfessionals[0].name}` : '');
+    }
   };
 
   const handleEquipmentToggle = (key: EquipmentKey) => {
@@ -290,6 +381,15 @@ export default function App() {
   };
 
   const handleAddSession = async (session: SessionEntry) => {
+    const savedSession: SessionEntry = {
+      ...session,
+      techniquesSummary: session.techniquesSummary
+        || session.manualTreatment
+        || session.treatmentPlan
+        || session.techniques.join(' | ')
+        || session.summary
+        || undefined,
+    };
     if (activeEpisodeId) {
       const primaryHypothesis = clinicalData?.hypotheses.find((hypothesis) => hypothesis.isPrimary)?.label;
       if (clinicalData?.region) {
@@ -305,14 +405,14 @@ export default function App() {
         .insert({
           patient_id: activePatient?.id,
           episode_id: activeEpisodeId,
-          date: session.date,
-          physio: session.physio,
-          eva: session.eva,
-          summary: session.summary,
-          techniques: session.techniques,
-          techniques_summary: session.techniquesSummary ?? null,
-          retest: session.retest,
-          improvement: session.improvement,
+          date: savedSession.date,
+          physio: savedSession.physio,
+          eva: savedSession.eva,
+          summary: savedSession.summary,
+          techniques: savedSession.techniques,
+          techniques_summary: savedSession.techniquesSummary ?? null,
+          retest: savedSession.retest,
+          improvement: savedSession.improvement,
         })
         .select()
         .single();
@@ -320,7 +420,7 @@ export default function App() {
         await loadSessionsForEpisode(activeEpisodeId);
       }
     } else {
-      setSessions((prev) => [...prev, session].sort((a, b) => a.date.localeCompare(b.date)));
+      setSessions((prev) => [...prev, savedSession].sort((a, b) => a.date.localeCompare(b.date)));
     }
   };
 
@@ -331,6 +431,7 @@ export default function App() {
   const handleSaveReport = async (report: ClinicalReportResult, techniquesSummary?: string) => {
     const sessionClinicalData: ClinicalSessionData | null = clinicalData ? {
       dynamicQuestions: clinicalData.dynamicQuestions,
+      openQuestionsNotes: clinicalData.openQuestionsNotes,
       dichotomousFindings: clinicalData.dichotomousFindings,
       redFlags: clinicalData.redFlags,
       yellowFlags: clinicalData.yellowFlags,
@@ -339,10 +440,16 @@ export default function App() {
       hypotheses: clinicalData.hypotheses,
       anamnesis: clinicalData.anamnesis,
       region: clinicalData.region,
+      complementary: clinicalData.complementary,
+      freeExploration: clinicalData.freeExploration,
+      sonoFindings: clinicalData.sonoFindings,
+      manualClinicalDiagnosis: clinicalData.manualClinicalDiagnosis,
+      manualTreatmentPlan: clinicalData.manualTreatmentPlan,
+      manualSonoFindings: clinicalData.manualSonoFindings,
       aiPrognosis: clinicalData.aiPrognosis,
       aiTreatment: clinicalData.aiTreatment,
       report,
-      techniquesSummary: techniquesSummary ?? null,
+      techniquesSummary: techniquesSummary || clinicalData.manualTreatmentPlan || report.treatmentPlan || clinicalData.aiTreatment || null,
       equipmentSafety: clinicalData.equipmentSafety ?? [],
       previousHypotheses: clinicalData.previousHypotheses,
       evolution: clinicalData.evolution,
@@ -356,7 +463,10 @@ export default function App() {
       evaPost: clinicalData?.comparable.evaPost ?? null,
       summary: report.clinicalDiagnosis.slice(0, 200),
       techniques: [],
-      techniquesSummary,
+      techniquesSummary: techniquesSummary || clinicalData?.manualTreatmentPlan || report.treatmentPlan || clinicalData?.aiTreatment || undefined,
+      treatmentSummary: techniquesSummary || clinicalData?.manualTreatmentPlan || report.treatmentPlan || clinicalData?.aiTreatment || undefined,
+      manualTreatment: clinicalData?.manualTreatmentPlan || undefined,
+      treatmentPlan: report.treatmentPlan || clinicalData?.aiTreatment || undefined,
       retest: report.relevantAsteriskSign.slice(0, 150),
       improvement: 0,
       clinicalData: sessionClinicalData,
@@ -383,7 +493,7 @@ export default function App() {
           eva_post: entry.evaPost,
           summary: entry.summary,
           techniques: entry.techniques,
-          techniques_summary: techniquesSummary ?? null,
+          techniques_summary: entry.techniquesSummary ?? null,
           retest: entry.retest,
           improvement: entry.improvement,
           clinical_data: sessionClinicalData,
@@ -701,17 +811,20 @@ export default function App() {
       anamnesis: (row.anamnesis as Episode['anamnesis']) ?? null,
       status: (row.status as Episode['status']) ?? 'active',
       createdAt: String(row.created_at ?? ''),
+      updatedAt: typeof row.updated_at === 'string' ? row.updated_at : undefined,
+      isClosed: typeof row.is_closed === 'boolean' ? row.is_closed : undefined,
       closedAt: (row.closed_at as string | undefined) ?? cachedClosureData[String(row.id)]?.closedAt,
       dischargeReason: (row.discharge_reason as Episode['dischargeReason']) ?? cachedClosureData[String(row.id)]?.dischargeReason,
       dischargeNotes: (row.discharge_notes as string | undefined) ?? cachedClosureData[String(row.id)]?.dischargeNotes,
       notes: (row.notes as string | undefined) ?? '',
     }));
+    const episodesWithActivity = await addLatestSessionActivity(loadedEpisodes);
     const patientsWithEpisodes = loadedPatients.map((patient) => ({
       ...patient,
-      episodes: loadedEpisodes.filter((episode) => episode.patientId === patient.id),
+      episodes: episodesWithActivity.filter((episode) => episode.patientId === patient.id),
     }));
     setPatients(patientsWithEpisodes);
-    setEpisodes(loadedEpisodes);
+    setEpisodes(episodesWithActivity);
   }, []);
 
   const handleSaveClinicalSession = useCallback(async (
@@ -770,9 +883,11 @@ export default function App() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         professionals={professionals}
+        professionalError={professionalError}
         selectedPhysio={selectedPhysio}
         onPhysioChange={setSelectedPhysio}
         onAddProfessional={handleAddProfessional}
+        onDeleteProfessional={handleDeleteProfessional}
         equipment={equipment}
         onEquipmentToggle={handleEquipmentToggle}
         geminiConfig={geminiConfig}
@@ -793,6 +908,7 @@ export default function App() {
             onOpenPatient={handleOpenAgendaPatient}
             onStartAppointment={handleStartAgendaAppointment}
             onOpenExpediente={handleOpenAgendaExpediente}
+            physiotherapist={selectedPhysio.replace(/^Fisio:\s*/, '')}
           />
         )}
         {activeTab === 'pacientes' && (
@@ -822,6 +938,14 @@ export default function App() {
             onDeleteEpisode={handleDeleteEpisode}
           />
         )}
+        {activeTab === 'caja' && (
+          <BillingScreen
+            patients={patients}
+            appointments={appointments}
+            physiotherapist={selectedPhysio.replace(/^Fisio:\s*/, '')}
+            onSaveAppointment={handleSaveAppointment}
+          />
+        )}
         {activeTab === 'informacion' && (
           <PatientInfoScreen patient={activePatient} onUpdatePatient={handleUpdatePatient} />
         )}
@@ -849,6 +973,7 @@ export default function App() {
             onAddSession={handleAddSession}
             equipment={equipment}
             physio={selectedPhysio}
+            geminiConfig={geminiConfig}
             activePatient={activePatient}
             activeEpisode={activeEpisode}
             episodes={episodes}

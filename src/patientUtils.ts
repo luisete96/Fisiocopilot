@@ -1,3 +1,5 @@
+import type { Episode } from './types';
+
 export function calculateAge(birthDate?: string | null): number | null {
   if (!birthDate) return null;
   const birth = new Date(/^\d{4}-\d{2}-\d{2}$/.test(birthDate) ? `${birthDate}T00:00:00` : birthDate);
@@ -15,6 +17,14 @@ export function normalizeText(value?: string | null): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim();
+}
+
+export function isEpisodeActive(episode: Pick<Episode, 'status' | 'isClosed'>): boolean {
+  const status = normalizeText(episode.status);
+  if (status === 'active' || status === 'abierto') return true;
+  if (episode.isClosed === false) return true;
+  if (episode.isClosed === true) return false;
+  return !['resolved', 'resuelto', 'closed', 'finalizado', 'alta'].includes(status);
 }
 
 const PATIENT_NOTES_PREFIX = '__fisiocopilot_patient_notes_v1__:';

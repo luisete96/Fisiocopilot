@@ -1,16 +1,44 @@
 import type { BodyRegion } from '../types';
 import { BODY_REGIONS } from '../mockData';
 
+export interface BodyMapSelection {
+  regionId: string;
+  laterality: '' | 'Derecho' | 'Izquierdo' | 'Bilateral' | 'Central';
+  subZones: string[];
+}
+
 interface BodyMapProps {
   selected: BodyRegion | null;
-  onSelect: (region: BodyRegion) => void;
+  onSelect: (region: BodyRegion | null) => void;
+  allowDeselect?: boolean;
+  multiSelect?: boolean;
+  selectedRegions?: BodyMapSelection[];
+  onSelectedRegionsChange?: (regions: BodyMapSelection[]) => void;
   laterality: string;
   onLateralityChange: (laterality: string) => void;
   subRegion: string;
   onSubRegionChange: (subRegion: string) => void;
 }
 
-const LATERALITIES = ['Derecho', 'Izquierdo', 'Bilateral', 'Central'];
+const LATERALITIES = ['Derecho', 'Izquierdo', 'Bilateral', 'Central'] as const;
+
+const FAST_TRACK_REGION_IDS: Partial<Record<BodyRegion, string>> = {
+  cervical: 'cervical',
+  dorsal: 'dorsal',
+  lumbar: 'lumbar',
+  pelvis: 'pelvis_cadera',
+  hombro: 'hombro',
+  codo: 'codo',
+  muneca: 'muneca_mano',
+  muslo: 'muslo',
+  rodilla: 'rodilla',
+  tobillo: 'tobillo',
+  pie: 'pie',
+};
+
+const BODY_REGION_BY_FAST_TRACK_ID = Object.fromEntries(
+  Object.entries(FAST_TRACK_REGION_IDS).map(([bodyRegion, regionId]) => [regionId, bodyRegion]),
+) as Record<string, BodyRegion>;
 
 const SUBREGIONS: Partial<Record<BodyRegion, string[]>> = {
   cervical: ['Cervical alta (C0-C3)', 'Cervical baja (C4-C7)', 'Paravertebral / Facetario', 'Trapecio superior', 'Irradiación interescapular'],
@@ -58,11 +86,37 @@ const PILL_GROUPS: { group: string; regions: { key: BodyRegion; label: string }[
 export function BodyMap({
   selected,
   onSelect,
+  allowDeselect = false,
+  multiSelect = false,
+  selectedRegions = [],
+  onSelectedRegionsChange,
   laterality,
   onLateralityChange,
   subRegion,
   onSubRegionChange,
 }: BodyMapProps) {
+  const changeSelection = (region: BodyRegion) => {
+    const regionId = FAST_TRACK_REGION_IDS[region];
+    if (!regionId || !onSelectedRegionsChange) return;
+    const isSelected = selectedRegions.some((item) => item.regionId === regionId);
+    onSelectedRegionsChange(isSelected
+      ? selectedRegions.filter((item) => item.regionId !== regionId)
+      : [...selectedRegions, { regionId, laterality: '', subZones: [] }]);
+  };
+  const changeLaterality = (regionId: string, value: BodyMapSelection['laterality']) => {
+    onSelectedRegionsChange?.(selectedRegions.map((item) => item.regionId === regionId
+      ? { ...item, laterality: item.laterality === value ? '' : value }
+      : item));
+  };
+  const changeSubZone = (regionId: string, value: string) => {
+    onSelectedRegionsChange?.(selectedRegions.map((item) => {
+      if (item.regionId !== regionId) return item;
+      const subZones = item.subZones.includes(value)
+        ? item.subZones.filter((zone) => zone !== value)
+        : [...item.subZones, value];
+      return { ...item, subZones };
+    }));
+  };
   const selectedLabel = selected
     ? BODY_REGIONS.find((r) => r.key === selected)?.label
     : null;
@@ -100,7 +154,62 @@ export function BodyMap({
 
       </div>
 
-      {selectedLabel && (
+      {multiSelect ? (
+        <div className="space-y-3">
+          {selectedRegions.map((selection) => {
+            const bodyRegion = BODY_REGION_BY_FAST_TRACK_ID[selection.regionId];
+            if (!bodyRegion) return null;
+            const label = BODY_REGIONS.find((item) => item.key === bodyRegion)?.label ?? bodyRegion;
+            return (
+              <div key={selection.regionId} className="space-y-3 rounded-lg border border-primary-200 bg-primary-50 px-4 py-3 text-center animate-fade-in">
+                <span className="block text-sm font-medium text-primary-700">
+                  Región seleccionada: {[label, ...selection.subZones, selection.laterality].filter(Boolean).join(' · ')}
+                </span>
+                <div>
+                  <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-primary-600">Lateralidad</p>
+                  <div className="flex flex-wrap justify-center gap-1.5">
+                    {LATERALITIES.map((side) => (
+                      <button
+                        type="button"
+                        key={side}
+                        aria-pressed={selection.laterality === side}
+                        onClick={() => changeLaterality(selection.regionId, side)}
+                        className={`rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
+                          selection.laterality === side
+                            ? 'bg-primary-600 text-white'
+                            : 'border border-primary-200 bg-white text-primary-700 hover:bg-primary-100'
+                        }`}
+                      >
+                        {side}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-primary-600">Sub-zonas anatómicas</p>
+                  <div className="flex flex-wrap justify-center gap-1.5">
+                    {(SUBREGIONS[bodyRegion] ?? []).map((zone) => (
+                      <button
+                        type="button"
+                        key={zone}
+                        aria-pressed={selection.subZones.includes(zone)}
+                        onClick={() => changeSubZone(selection.regionId, zone)}
+                        className={`rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
+                          selection.subZones.includes(zone)
+                            ? 'bg-primary-600 text-white'
+                            : 'border border-primary-200 bg-white text-primary-700 hover:bg-primary-100'
+                        }`}
+                      >
+                        {zone}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : selectedLabel && (
         <div className="space-y-3 rounded-lg border border-primary-200 bg-primary-50 px-4 py-3 text-center animate-fade-in">
           <span className="block text-sm font-medium text-primary-700">
             Región seleccionada: {[selectedLabel, subRegion, laterality].filter(Boolean).join(' · ')}
@@ -158,12 +267,17 @@ export function BodyMap({
             </p>
             <div className="flex flex-wrap gap-1.5">
               {group.regions.map((r) => {
-                const isSelected = selected === r.key;
+                const isSelected = multiSelect
+                  ? selectedRegions.some((item) => item.regionId === FAST_TRACK_REGION_IDS[r.key])
+                  : selected === r.key;
                 return (
                   <button
                     type="button"
                     key={r.key}
-                    onClick={() => onSelect(r.key)}
+                    onClick={() => {
+                      if (multiSelect) changeSelection(r.key);
+                      else onSelect(allowDeselect && isSelected ? null : r.key);
+                    }}
                     className={`rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
                       isSelected
                         ? 'bg-primary-600 text-white shadow-sm'

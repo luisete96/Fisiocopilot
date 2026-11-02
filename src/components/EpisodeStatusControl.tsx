@@ -4,6 +4,7 @@ import type { Episode } from '../types';
 import { Button } from './ui/Button';
 import { Badge } from './ui/Badge';
 import { Modal } from './ui/Modal';
+import { isEpisodeActive } from '../patientUtils';
 
 export function EpisodeStatusControl({
   episode,
@@ -25,6 +26,7 @@ export function EpisodeStatusControl({
       await onUpdate(episode.patientId, {
         ...episode,
         status: 'resolved',
+        isClosed: true,
         closedAt: new Date().toISOString(),
         dischargeReason: reason,
         dischargeNotes: notes.trim(),
@@ -45,6 +47,7 @@ export function EpisodeStatusControl({
       await onUpdate(episode.patientId, {
         ...episode,
         status: 'active',
+        isClosed: false,
         closedAt: undefined,
         dischargeReason: undefined,
         dischargeNotes: undefined,
@@ -57,7 +60,7 @@ export function EpisodeStatusControl({
 
   return (
     <>
-      {episode.status === 'active' ? (
+      {isEpisodeActive(episode) ? (
         <button
           type="button"
           onClick={() => { setError(null); setOpen(true); }}

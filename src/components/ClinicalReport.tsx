@@ -14,8 +14,6 @@ import {
   CLINICAL_REPORT_RESPONSE_SCHEMA,
   buildClinicalReportPrompt,
   parseClinicalReportResult,
-  buildTechniquesSummaryPrompt,
-  parseTechniquesSummaryResult,
 } from '../geminiService';
 import { Modal } from './ui/Modal';
 import { Button } from './ui/Button';
@@ -88,9 +86,9 @@ export function ClinicalReport(props: ClinicalReportProps) {
         therapeuticGoals:
           response.therapeuticGoals ||
           'No se pudieron extraer los objetivos terapéuticos. Pulsa Regenerar con IA.',
-        treatmentPlan:
-          response.treatmentPlan ||
-          'No se pudo extraer el plan de tratamiento. Pulsa Regenerar con IA.',
+        treatmentPlan: clinicalData.isLiteMode
+          ? clinicalData.manualTreatmentPlan ?? ''
+          : clinicalData.aiTreatment ?? '',
         relevantAsteriskSign:
           response.relevantAsteriskSign ||
           'No se pudo extraer el signo comparable y métrica de retest. Pulsa Regenerar con IA.',
@@ -141,18 +139,9 @@ export function ClinicalReport(props: ClinicalReportProps) {
 
   const handleSave = async () => {
     setSaving(true);
-    let techniquesSummary: string | undefined;
     try {
-      if (hasApiKey && report.treatmentPlan) {
-        const prompt = buildTechniquesSummaryPrompt(report.treatmentPlan, activeEquipment);
-        const raw = await callGemini(prompt, geminiConfig);
-        const result = parseTechniquesSummaryResult(raw);
-        techniquesSummary = result.techniquesSummary || undefined;
-      }
-    } catch {
-      // techniquesSummary is optional — save without it
+      await onSave(report);
     } finally {
-      onSave(report, techniquesSummary);
       setSaving(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);

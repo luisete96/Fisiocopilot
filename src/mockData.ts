@@ -1,6 +1,6 @@
 import type {
-  Equipment, EquipmentKey, BodyRegion, BodyRegionInfo,
-  OrthopedicTest, RedFlag, YellowFlag, DiagnosticHypothesis,
+  Equipment, BodyRegionInfo,
+  OrthopedicTest, RedFlag, YellowFlag,
   SessionEntry,
 } from './types';
 
@@ -137,36 +137,6 @@ export const INITIAL_TESTS: OrthopedicTest[] = [
   },
 ];
 
-export const INITIAL_HYPOTHESES: DiagnosticHypothesis[] = [
-  {
-    id: 'hyp-1',
-    label: 'Tendinopatía del supraespinoso',
-    compatibility: 0,
-    isPrimary: true,
-    painPhenotype: 'Nociceptivo (mecánico/isquémico)',
-    justification: 'El dolor se reproduce con elevación del brazo y mejora con el reposo relativo. Sugerente de sobrecarga mecánica del tendón.',
-    differentialTest: 'Resistencia isométrica en abducción a 90°',
-  },
-  {
-    id: 'hyp-2',
-    label: 'Pinzamiento subacromial (impingement)',
-    compatibility: 0,
-    isPrimary: false,
-    painPhenotype: 'Nociceptivo (mecánico)',
-    justification: 'Arco doloroso positivo y test de Hawkins-Kennedy positivo. Compresión del manguito rotador bajo el arco coracoacromial.',
-    differentialTest: 'Test de_arco doloroso vs Hawkins-Kennedy',
-  },
-  {
-    id: 'hyp-3',
-    label: 'Capsulitis adhesiva (hombro congelado)',
-    compatibility: 0,
-    isPrimary: false,
-    painPhenotype: 'Nociceptivo (inflamatorio/mecánico)',
-    justification: 'Limitación de movilidad activa y pasiva en todas las direcciones. Descartar si el ROM pasivo está preservado.',
-    differentialTest: 'Movilidad pasiva vs activa — limitación en ambas direcciones',
-  },
-];
-
 export const SONO_CHECKLIST: { id: string; label: string; checked: boolean }[] = [
   { id: 'sono-1', label: 'Tendón del supraespinoso: grosor, ecoestructura, calcificaciones', checked: false },
   { id: 'sono-2', label: 'Bursa subacromial-subdeltoidea: engrosamiento o líquido', checked: false },
@@ -176,27 +146,6 @@ export const SONO_CHECKLIST: { id: string; label: string; checked: boolean }[] =
   { id: 'sono-6', label: 'Articulación acromioclavicular: signos de artrosis / edema', checked: false },
   { id: 'sono-7', label: 'Dynamic impingement test ecoguiado', checked: false },
   { id: 'sono-8', label: 'Músculo serrato anterior / subescapular', checked: false },
-];
-
-export const PROGNOSIS_GRADES = [
-  {
-    grade: 'Grado I',
-    timeline: '1–4 semanas',
-    title: 'Recovery rápida',
-    explanation: 'Buen pronóstico. Mejoría esperada en 1-4 semanas con tratamiento conservador y ejercicio progresivo.',
-  },
-  {
-    grade: 'Grado II',
-    timeline: '4–12 semanas',
-    title: 'Recovery moderada',
-    explanation: 'Pronóstico moderado. Se espera mejoría en 4-12 semanas con tratamiento fisioterápico regular y progresión de carga.',
-  },
-  {
-    grade: 'Grado III',
-    timeline: '3–6+ meses',
-    title: 'Recovery prolongada',
-    explanation: 'Pronóstico más prolongado. Puede requerir 3-6+ meses de tratamiento con ejercicio progresivo y reevaluación periódica.',
-  },
 ];
 
 export const INITIAL_SESSIONS: SessionEntry[] = [];

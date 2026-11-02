@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  Activity, Calendar, Check, ChevronLeft, ChevronRight, Clock, FileText,
-  Pencil, Phone, Plus, Stethoscope, Trash2, User, X,
+  Activity, Calendar, Check, ChevronLeft, ChevronRight, Clock, CreditCard,
+  FileText, Pencil, Phone, Plus, Stethoscope, Trash2, User, X,
 } from 'lucide-react';
 import type {
   Appointment, AppointmentStatus, AppointmentType, Episode, Patient,
@@ -9,6 +9,8 @@ import type {
 import { Button } from './ui/Button';
 import { Card, CardHeader } from './ui/Card';
 import { Modal } from './ui/Modal';
+import { AppointmentPaymentModal } from './AppointmentPaymentModal';
+import { getSupabaseClient } from '../supabaseClient';
 
 interface AgendaScreenProps {
   appointments: Appointment[];
@@ -20,6 +22,7 @@ interface AgendaScreenProps {
   onOpenPatient: (patientId: string) => void;
   onStartAppointment: (appointment: Appointment) => Promise<void>;
   onOpenExpediente: (appointment: Appointment) => Promise<void>;
+  physiotherapist: string;
 }
 
 type AgendaView = 'day' | 'list';
@@ -98,7 +101,7 @@ function formatSelectedDate(value: string): string {
 
 export function AgendaScreen({
   appointments, patients, episodes, onSaveAppointment, onDeleteAppointment,
-  onCreatePatient, onOpenPatient, onStartAppointment, onOpenExpediente,
+  onCreatePatient, onOpenPatient, onStartAppointment, onOpenExpediente, physiotherapist,
 }: AgendaScreenProps) {
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
   const [view, setView] = useState<AgendaView>('day');
@@ -111,6 +114,32 @@ export function AgendaScreen({
   const [creatingPatient, setCreatingPatient] = useState(false);
   const [newPatientName, setNewPatientName] = useState('');
   const [newPatientPhone, setNewPatientPhone] = useState('');
+  const [paymentAppointment, setPaymentAppointment] = useState<Appointment | null>(null);
+  const [paidAppointmentIds, setPaidAppointmentIds] = useState<Set<string>>(() => new Set());
+  const [paymentLookupError, setPaymentLookupError] = useState<string | null>(null);
+  const [paymentActionNotice, setPaymentActionNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const loadPaidAppointments = async () => {
+      const { data, error } = await getSupabaseClient()
+        .from('billing_transactions')
+        .select('appointment_id')
+        .not('appointment_id', 'is', null);
+      if (!active) return;
+      if (error) {
+        console.error('No se pudieron consultar los cobros asociados a las citas:', error);
+        setPaymentLookupError(`No se pudo comprobar si las citas están cobradas: ${error.message}`);
+        return;
+      }
+      setPaymentLookupError(null);
+      setPaidAppointmentIds(new Set((data ?? [])
+        .map((row: { appointment_id: string | null }) => row.appointment_id)
+        .filter((appointmentId): appointmentId is string => Boolean(appointmentId))));
+    };
+    void loadPaidAppointments();
+    return () => { active = false; };
+  }, [appointments]);
 
   const dayAppointments = useMemo(() => appointments
     .filter((appointment) => appointment.date === selectedDate)
@@ -153,7 +182,25 @@ export function AgendaScreen({
   };
 
   const updateStatus = (appointment: Appointment, status: AppointmentStatus) => {
+    if (status === 'completed') {
+      setPaymentAppointment(appointment);
+      return;
+    }
     void onSaveAppointment({ ...appointment, status });
+  };
+
+  const completeAppointmentPayment = async (transactionId: string) => {
+    if (!paymentAppointment) return;
+    if (!transactionId) throw new Error('El cobro no devolvió un identificador de transacción.');
+    setPaidAppointmentIds((previous) => new Set(previous).add(paymentAppointment.id));
+    setPaymentAppointment(null);
+    setPaymentActionNotice(null);
+    try {
+      await onSaveAppointment({ ...paymentAppointment, status: 'completed' });
+    } catch (saveError) {
+      console.error('El cobro se registró, pero no se pudo actualizar el estado de la cita:', saveError);
+      setPaymentActionNotice('El cobro quedó registrado. No lo repitas; actualiza el estado de la cita desde Editar.');
+    }
   };
 
   const saveDraft = async () => {
@@ -207,6 +254,16 @@ export function AgendaScreen({
 
   return (
     <div className="mx-auto max-w-[1440px] px-4 py-6 lg:px-6">
+      {paymentLookupError && (
+        <p role="alert" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          {paymentLookupError}. Aplica las migraciones de caja para comprobar los cobros asociados.
+        </p>
+      )}
+      {paymentActionNotice && (
+        <p role="status" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          {paymentActionNotice}
+        </p>
+      )}
       <Card className="mb-5 p-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
@@ -286,6 +343,8 @@ export function AgendaScreen({
                             if (window.confirm('¿Eliminar esta cita de la agenda?')) onDeleteAppointment(appointment.id);
                           }}
                           onComplete={() => updateStatus(appointment, 'completed')}
+                          onCharge={() => setPaymentAppointment(appointment)}
+                          hasPayment={paidAppointmentIds.has(appointment.id)}
                           onCancel={() => updateStatus(appointment, 'cancelled')}
                         />
                       );
@@ -324,6 +383,8 @@ export function AgendaScreen({
                   if (window.confirm('¿Eliminar esta cita de la agenda?')) onDeleteAppointment(appointment.id);
                 }}
                 onComplete={() => updateStatus(appointment, 'completed')}
+                onCharge={() => setPaymentAppointment(appointment)}
+                hasPayment={paidAppointmentIds.has(appointment.id)}
                 onCancel={() => updateStatus(appointment, 'cancelled')}
               />
             ))}
@@ -425,6 +486,16 @@ export function AgendaScreen({
           )}
         </div>
       </Modal>
+      {paymentAppointment && (
+        <AppointmentPaymentModal
+          open
+          appointment={paymentAppointment}
+          patient={patients.find((patient) => patient.id === paymentAppointment.patientId)}
+          physiotherapist={physiotherapist}
+          onClose={() => setPaymentAppointment(null)}
+          onPaymentComplete={completeAppointmentPayment}
+        />
+      )}
     </div>
   );
 }
@@ -435,7 +506,7 @@ function SummaryPill({ label }: { label: string }) {
 
 function AppointmentCard({
   appointment, patient, episode, onOpenPatient, onStart, onOpenExpediente, onEdit,
-  onDelete, onComplete, onCancel,
+  onDelete, onComplete, onCancel, onCharge, hasPayment,
 }: {
   appointment: Appointment;
   patient?: Patient;
@@ -447,6 +518,8 @@ function AppointmentCard({
   onDelete: () => void;
   onComplete: () => void;
   onCancel: () => void;
+  onCharge: () => void;
+  hasPayment: boolean;
 }) {
   const isCancelled = appointment.status === 'cancelled';
   return (
@@ -475,9 +548,19 @@ function AppointmentCard({
           <Button variant="outline" size="sm" onClick={onOpenExpediente}><FileText className="h-3.5 w-3.5" /> Expediente</Button>
           {appointment.status !== 'completed' && appointment.status !== 'cancelled' && (
             <>
-              <Button variant="outline" size="sm" onClick={onComplete}><Check className="h-3.5 w-3.5" /> Completada</Button>
+              <Button variant="outline" size="sm" onClick={onComplete}><CreditCard className="h-3.5 w-3.5" /> Cobrar y completar</Button>
               <Button variant="outline" size="sm" onClick={onCancel}><X className="h-3.5 w-3.5" /> Cancelar</Button>
             </>
+          )}
+          {appointment.status === 'completed' && !hasPayment && (
+            <Button variant="outline" size="sm" onClick={onCharge} className="border-primary-200 text-primary-700 hover:bg-primary-50">
+              <CreditCard className="h-3.5 w-3.5" /> Cobrar sesión
+            </Button>
+          )}
+          {appointment.status === 'completed' && hasPayment && (
+            <span className="inline-flex items-center gap-1.5 self-center px-2 py-1 text-xs font-medium text-success-700">
+              <Check className="h-3.5 w-3.5" /> Cobrada
+            </span>
           )}
           <Button variant="ghost" size="sm" onClick={onEdit}><Pencil className="h-3.5 w-3.5" /> Editar</Button>
           <Button variant="ghost" size="sm" onClick={onDelete}><Trash2 className="h-3.5 w-3.5" /> Eliminar</Button>

@@ -92,6 +92,29 @@ create table if not exists public.sessions (
   clinical_data jsonb
 );
 
+create table if not exists public.physiotherapists (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  is_active boolean not null default true,
+  created_at timestamptz not null default timezone('utc'::text, now())
+);
+
+create unique index if not exists idx_physiotherapists_active_name
+  on public.physiotherapists (lower(name))
+  where is_active = true;
+
+insert into public.physiotherapists (name)
+select 'Luis'
+where not exists (
+  select 1 from public.physiotherapists where lower(name) = lower('Luis')
+);
+
+insert into public.physiotherapists (name)
+select 'Carlos'
+where not exists (
+  select 1 from public.physiotherapists where lower(name) = lower('Carlos')
+);
+
 alter table public.sessions
   add column if not exists patient_id uuid,
   add column if not exists episode_id uuid,
@@ -151,6 +174,7 @@ create index if not exists idx_sessions_episode_id_date
 alter table public.patients enable row level security;
 alter table public.episodes enable row level security;
 alter table public.sessions enable row level security;
+alter table public.physiotherapists enable row level security;
 
 drop policy if exists "shared_clinic_access_patients" on public.patients;
 drop policy if exists "Permitir todo en patients" on public.patients;
@@ -179,9 +203,17 @@ create policy "shared_clinic_access_sessions"
   using (true)
   with check (true);
 
+drop policy if exists "shared_clinic_access_physiotherapists" on public.physiotherapists;
+create policy "shared_clinic_access_physiotherapists"
+  on public.physiotherapists
+  for all
+  to anon, authenticated
+  using (true)
+  with check (true);
+
 grant usage on schema public to anon, authenticated;
 grant select, insert, update, delete
-  on public.patients, public.episodes, public.sessions
+  on public.patients, public.episodes, public.sessions, public.physiotherapists
   to anon, authenticated;
 
 notify pgrst, 'reload schema';

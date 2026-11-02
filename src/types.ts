@@ -1,4 +1,64 @@
-export type TabKey = 'agenda' | 'pacientes' | 'valoracion' | 'expediente' | 'informacion';
+export type TabKey = 'agenda' | 'pacientes' | 'valoracion' | 'expediente' | 'informacion' | 'caja';
+
+export type BillingCategory = 'servicio' | 'bono' | 'producto' | 'canje_bono';
+export type PaymentMethod = 'efectivo' | 'tarjeta' | 'bizum' | 'transferencia' | 'bono';
+
+export interface CatalogItem {
+  id: string;
+  name: string;
+  category: Exclude<BillingCategory, 'canje_bono'>;
+  price: number;
+  vatRate: number;
+  totalSessions: number;
+  isActive: boolean;
+}
+
+export interface PatientVoucher {
+  id: string;
+  patientId: string | null;
+  patientName: string;
+  voucherName: string;
+  totalSessions: number;
+  usedSessions: number;
+  remainingSessions: number;
+  status: 'activo' | 'agotado';
+  purchaseDate: string;
+}
+
+export interface BillingTransaction {
+  id: string;
+  transactionDate: string;
+  patientId: string | null;
+  patientName: string;
+  itemId: string | null;
+  appointmentId?: string | null;
+  concept: string;
+  category: BillingCategory;
+  baseAmount: number;
+  vatRate: number;
+  vatAmount: number;
+  totalAmount: number;
+  paymentMethod: PaymentMethod;
+  physiotherapistName: string | null;
+  voucherId: string | null;
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface CashClosure {
+  id: string;
+  closureDate: string;
+  totalEfectivo: number;
+  totalTarjeta: number;
+  totalBizum: number;
+  totalTransferencia: number;
+  totalServiciosExentos: number;
+  totalProductosBase: number;
+  totalIvaRepercutido: number;
+  totalFacturado: number;
+  closedBy: string | null;
+  notes: string | null;
+}
 
 export type AppointmentStatus = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 export type AppointmentType = 'primera_valoracion' | 'seguimiento' | 'readaptacion' | 'ecografia_invasiva';
@@ -38,11 +98,15 @@ export type TestResult = 'positivo' | 'negativo' | 'dudoso' | null;
 export interface OrthopedicTest {
   id: string;
   name: string;
+  isStatic?: boolean;
+  regionId?: string;
   region: string;
   description: string;
   position: string;
+  patientPosition?: string;
   maneuver: string;
   positiveCriteria: string;
+  positivityCriteria?: string;
   sensitivity?: string | number | null;
   specificity?: string | number | null;
   sensibilidad?: string | number | null;
@@ -134,12 +198,17 @@ export interface AIHypothesisResult {
 export interface SessionEntry {
   id: string;
   date: string;
+  createdAt?: string;
   physio: string;
   eva: number;
   evaPost?: number | null;
   summary: string;
   techniques: string[];
   techniquesSummary?: string;
+  treatmentSummary?: string;
+  shortTreatment?: string;
+  manualTreatment?: string;
+  treatmentPlan?: string;
   retest: string;
   improvement: number;
   episodeId?: string;
@@ -148,6 +217,7 @@ export interface SessionEntry {
 
 export interface ClinicalSessionData {
   dynamicQuestions?: string[];
+  openQuestionsNotes?: string;
   dichotomousFindings: {
     label: string;
     answer: string;
@@ -158,9 +228,16 @@ export interface ClinicalSessionData {
     previousAnswer?: string;
   }[];
   redFlags: { label: string; status: string }[];
-  yellowFlags: { label: string; checked: boolean }[];
+  yellowFlags: { label: string; checked: boolean   }[];
   tests: {
     name: string;
+    region?: string;
+    description?: string;
+    position?: string;
+    maneuver?: string;
+    positiveCriteria?: string;
+    sensitivity?: string | number | null;
+    specificity?: string | number | null;
     result: string;
     needsRetest?: boolean;
     retestReason?: string;
@@ -171,6 +248,16 @@ export interface ClinicalSessionData {
   hypotheses: DiagnosticHypothesis[];
   anamnesis?: { que: string; porque: string; desde: string };
   region?: string;
+  complementary?: string;
+  freeExploration?: string;
+  sonoFindings?: {
+    structure: string;
+    findings: string[];
+    notes: string;
+  }[];
+  manualClinicalDiagnosis?: string;
+  manualTreatmentPlan?: string;
+  manualSonoFindings?: string;
   aiPrognosis?: AIPrognosis | null;
   aiTreatment?: string | null;
   report?: ClinicalReportResult | null;
@@ -236,6 +323,9 @@ export interface DichotomousFinding {
   label: string;
   answer: DichotomousAnswer;
   note: string;
+  text?: string;
+  sourceRegionId?: string;
+  isStatic?: boolean;
   needsReevaluation?: boolean;
   reevaluationReason?: string;
   evolutionStatus?: 'unchanged' | 'improved' | 'resolved';
@@ -285,8 +375,11 @@ export interface Episode {
   title: string;
   region: string | null;
   anamnesis: { que: string; porque: string; desde: string } | null;
-  status: 'active' | 'resolved';
+  status: 'active' | 'resolved' | 'abierto' | 'closed' | 'finalizado' | 'alta';
   createdAt: string;
+  updatedAt?: string;
+  isClosed?: boolean;
+  latestSessionAt?: string;
   closedAt?: string;
   dischargeReason?: 'alta_clinica' | 'derivacion' | 'abandono';
   dischargeNotes?: string;
@@ -322,9 +415,14 @@ export interface SonoTargetsResult {
 }
 
 export interface ClinicalData {
+  isLiteMode?: boolean;
   anamnesis: { que: string; porque: string; desde: string };
+  manualClinicalDiagnosis?: string;
+  manualTreatmentPlan?: string;
+  manualSonoFindings?: string;
   region: string;
   dynamicQuestions?: string[];
+  openQuestionsNotes?: string;
   dichotomousFindings: {
     label: string;
     answer: string;
@@ -339,6 +437,13 @@ export interface ClinicalData {
   complementary: string;
   tests: {
     name: string;
+    region?: string;
+    description?: string;
+    position?: string;
+    maneuver?: string;
+    positiveCriteria?: string;
+    sensitivity?: string | number | null;
+    specificity?: string | number | null;
     result: string;
     needsRetest?: boolean;
     retestReason?: string;

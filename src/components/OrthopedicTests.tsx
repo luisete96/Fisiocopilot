@@ -44,8 +44,11 @@ function TestRow({
             type="button"
             onClick={() => setModalOpen(true)}
             className="flex flex-1 items-center gap-2 text-left"
+            title={test.isStatic ? 'Ver información clínica del test' : 'Ver detalles del test'}
           >
-            <Info className="h-4 w-4 shrink-0 text-slate-400" />
+            {test.isStatic
+              ? <HelpCircle className="h-4 w-4 shrink-0 text-slate-400" />
+              : <Info className="h-4 w-4 shrink-0 text-slate-400" />}
             <span className="text-sm font-medium text-slate-800 hover:text-primary-600">{test.name}</span>
             {test.result && (
               <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${resultConfig[test.result].color}`}>
@@ -109,27 +112,24 @@ function TestRow({
         open={modalOpen}
         onClose={() => setModalOpen(false)}
         title={test.name}
-        subtitle={`Test ortopédico · Región: ${test.region}`}
+        subtitle={`Test ortopédico · Región/sub-zona: ${test.region || 'no especificada'}`}
         size="lg"
       >
         <div className="space-y-4">
           <div className="rounded-lg bg-slate-50 p-4">
-            <p className="text-sm text-slate-600">{test.description}</p>
+            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Descripción clínica y fundamento</p>
+            <p className="whitespace-pre-wrap text-sm text-slate-700">{test.description || 'Información no disponible.'}</p>
           </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <DetailField label="Posición del paciente / fisio" value={test.position} />
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DetailField label="Posición del paciente / fisio" value={test.patientPosition || test.position} />
             <DetailField label="Maniobra" value={test.maneuver} />
-            <DetailField label="Criterio de positividad" value={test.positiveCriteria} />
-            <div className="grid grid-cols-2 gap-3">
-              <StatCard
-                label="Sensibilidad"
-                value={formatPercentage(test.sensitivity)}
-              />
-              <StatCard
-                label="Especificidad"
-                value={formatPercentage(test.specificity)}
-              />
+            <div className="sm:col-span-2">
+              <DetailField label="Criterio de positividad" value={test.positivityCriteria || test.positiveCriteria} />
             </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <StatCard label="Sensibilidad" value={formatPercentage(test.sensitivity)} />
+            <StatCard label="Especificidad" value={formatPercentage(test.specificity)} />
           </div>
         </div>
       </Modal>
@@ -182,9 +182,9 @@ function ResultButton({
 
 function DetailField({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div className="rounded-lg border border-slate-100 bg-white p-3">
       <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">{label}</p>
-      <p className="text-sm text-slate-700">{value}</p>
+      <p className="whitespace-pre-wrap text-sm text-slate-700">{value || 'Información no disponible.'}</p>
     </div>
   );
 }

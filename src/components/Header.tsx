@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import {
   Activity, Settings, ChevronDown, UserPlus, Check, Waves, Calendar,
   Bed, Gauge, Syringe, Dumbbell, Radio, Stethoscope, Users, Zap,
-  Contact,
+  Contact, Trash2, Wallet,
 } from 'lucide-react';
 import type { TabKey, EquipmentKey, GeminiConfig } from '../types';
 import { EQUIPMENT } from '../mockData';
@@ -13,10 +13,12 @@ import { Button } from './ui/Button';
 interface HeaderProps {
   activeTab: TabKey;
   onTabChange: (tab: TabKey) => void;
-  professionals: string[];
+  professionals: { id: string; name: string }[];
+  professionalError: string | null;
   selectedPhysio: string;
   onPhysioChange: (p: string) => void;
-  onAddProfessional: (name: string) => void;
+  onAddProfessional: (name: string) => Promise<void>;
+  onDeleteProfessional: (id: string) => Promise<void>;
   equipment: Record<EquipmentKey, boolean>;
   onEquipmentToggle: (key: EquipmentKey) => void;
   geminiConfig: GeminiConfig;
@@ -43,9 +45,11 @@ export function Header({
   activeTab,
   onTabChange,
   professionals,
+  professionalError,
   selectedPhysio,
   onPhysioChange,
   onAddProfessional,
+  onDeleteProfessional,
   equipment,
   onEquipmentToggle,
   geminiConfig,
@@ -58,6 +62,7 @@ export function Header({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [addingPhysio, setAddingPhysio] = useState(false);
   const [newPhysioName, setNewPhysioName] = useState('');
+  const [savingPhysio, setSavingPhysio] = useState(false);
   const [configDraft, setConfigDraft] = useState<GeminiConfig>(geminiConfig);
 
   const physioRef = useRef<HTMLDivElement>(null);
@@ -79,12 +84,19 @@ export function Header({
   const activeEquipmentCount = Object.values(equipment).filter(Boolean).length;
   const shortPhysio = selectedPhysio.replace('Fisio: ', '');
 
-  const handleAddPhysio = () => {
+  const handleAddPhysio = async () => {
     const name = newPhysioName.trim();
-    if (name) {
-      onAddProfessional(name);
-      setNewPhysioName('');
-      setAddingPhysio(false);
+    if (name && !savingPhysio) {
+      setSavingPhysio(true);
+      try {
+        await onAddProfessional(name);
+        setNewPhysioName('');
+        setAddingPhysio(false);
+      } catch {
+        // The parent displays the Supabase error beside the selector.
+      } finally {
+        setSavingPhysio(false);
+      }
     }
   };
 
@@ -130,33 +142,62 @@ export function Header({
                 </button>
                 {physioOpen && (
                   <div className="absolute right-0 mt-2 w-56 rounded-xl border border-slate-200 bg-white py-2 shadow-modal animate-slide-up">
-                    {professionals.map((p) => (
-                      <button
-                        type="button"
-                        key={p}
-                        onClick={() => {
-                          onPhysioChange(p);
-                          setPhysioOpen(false);
-                        }}
-                        className="flex w-full items-center justify-between px-4 py-2 text-sm text-slate-700 hover:bg-slate-50"
-                      >
-                        <span>{p}</span>
-                        {p === selectedPhysio && <Check className="h-4 w-4 text-primary-600" />}
-                      </button>
-                    ))}
+                    {professionals.map((professional) => {
+                      const label = `Fisio: ${professional.name}`;
+                      return (
+                        <div key={professional.id} className="flex items-center px-2 hover:bg-slate-50">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onPhysioChange(label);
+                              setPhysioOpen(false);
+                            }}
+                            className="flex min-w-0 flex-1 items-center justify-between px-2 py-2 text-left text-sm text-slate-700"
+                          >
+                            <span className="truncate">{label}</span>
+                            {label === selectedPhysio && <Check className="ml-2 h-4 w-4 shrink-0 text-primary-600" />}
+                          </button>
+                          <button
+                            type="button"
+                            title={`Eliminar a ${professional.name}`}
+                            aria-label={`Eliminar a ${professional.name}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              if (window.confirm(`¿Eliminar a ${professional.name} de la lista de fisioterapeutas?`)) {
+                                void onDeleteProfessional(professional.id).catch(() => undefined);
+                              }
+                            }}
+                            className="rounded-md p-2 text-slate-400 transition-colors hover:bg-error-50 hover:text-error-600"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {professionals.length === 0 && (
+                      <p className="px-4 py-2 text-xs text-slate-500">No hay fisioterapeutas activos.</p>
+                    )}
+                    {professionalError && (
+                      <p role="alert" className="mx-3 my-2 rounded-lg bg-error-50 px-3 py-2 text-xs text-error-700">
+                        {professionalError}
+                      </p>
+                    )}
                     {addingPhysio ? (
                       <div className="border-t border-slate-100 px-3 pt-2">
                         <input
                           autoFocus
                           value={newPhysioName}
                           onChange={(e) => setNewPhysioName(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleAddPhysio()}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void handleAddPhysio();
+                          }}
+                          disabled={savingPhysio}
                           placeholder="Nombre del profesional"
                           className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-primary-400"
                         />
                         <div className="mt-2 flex gap-2">
-                          <Button size="sm" type="button" onClick={handleAddPhysio}>Añadir</Button>
-                          <Button size="sm" type="button" variant="ghost" onClick={() => setAddingPhysio(false)}>Cancelar</Button>
+                          <Button size="sm" type="button" onClick={() => void handleAddPhysio()} disabled={savingPhysio}>Añadir</Button>
+                          <Button size="sm" type="button" variant="ghost" onClick={() => setAddingPhysio(false)} disabled={savingPhysio}>Cancelar</Button>
                         </div>
                       </div>
                     ) : (
@@ -250,6 +291,12 @@ export function Header({
               onClick={() => onTabChange('pacientes')}
               icon={<Users className="h-4 w-4" />}
               label="Pacientes"
+            />
+            <TabButton
+              active={activeTab === 'caja'}
+              onClick={() => onTabChange('caja')}
+              icon={<Wallet className="h-4 w-4" />}
+              label="Caja y Tarifas"
             />
             <div className="mx-2 h-5 w-px self-center bg-slate-200" />
             <span className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">

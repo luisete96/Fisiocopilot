@@ -3,7 +3,7 @@ import {
   MessageSquareText, AlertTriangle, ShieldCheck, FileText,
   Stethoscope, Zap, Brain, Target, ChevronRight, Check, X,
   Microscope, ClipboardList, TrendingUp, Lightbulb, Loader2, Pencil,
-  Mic, MicOff, ChevronDown, History, RefreshCw, Sparkles,
+  Mic, MicOff, ChevronDown, History, RefreshCw,
 } from 'lucide-react';
 import type {
   BodyRegion, OrthopedicTest, TestResult, RedFlag, YellowFlag,
@@ -13,17 +13,113 @@ import type {
 } from '../types';
 import {
   DYNAMIC_QUESTIONS, INITIAL_RED_FLAGS, YELLOW_FLAGS, INITIAL_TESTS,
-  INITIAL_HYPOTHESES, PROGNOSIS_GRADES, EQUIPMENT, BODY_REGIONS,
+  EQUIPMENT, BODY_REGIONS,
 } from '../mockData';
 import { Card, CardHeader } from './ui/Card';
 import { Button } from './ui/Button';
 import { Badge } from './ui/Badge';
 import { Modal } from './ui/Modal';
 import { BodyMap } from './BodyMap';
+import type { BodyMapSelection } from './BodyMap';
 import { OrthopedicTests } from './OrthopedicTests';
 import { calculateAge, normalizeText } from '../patientUtils';
-import { callGemini, transcribeClinicalAudio, TRIAJE_RESPONSE_SCHEMA, TRIAJE_MAX_OUTPUT_TOKENS, TESTS_RESPONSE_SCHEMA, TESTS_MAX_OUTPUT_TOKENS, HYPOTHESIS_RESPONSE_SCHEMA, HYPOTHESIS_MAX_OUTPUT_TOKENS, buildHypothesisPrompt, parseHypothesisResult, buildTriajePrompt, parseTriajeResult, buildTestsPrompt, parseTestsResult, buildTranscriptPrompt, parseTranscriptResult, buildSonoTargetsPrompt, parseSonoTargetsResult } from '../geminiService';
-import type { TranscriptResult } from '../types';
+import { CLINICAL_FAST_TRACK } from '../data/clinicalFastTrack';
+import type { FastTrackRegion } from '../data/clinicalFastTrack';
+import { callGemini, transcribeClinicalAudio, TRIAJE_RESPONSE_SCHEMA, TRIAJE_MAX_OUTPUT_TOKENS, TESTS_RESPONSE_SCHEMA, TESTS_FOLLOW_UP_RESPONSE_SCHEMA, TESTS_MAX_OUTPUT_TOKENS, HYPOTHESIS_RESPONSE_SCHEMA, HYPOTHESIS_MAX_OUTPUT_TOKENS, buildHypothesisPrompt, parseHypothesisResult, buildTriajePrompt, parseTriajeResult, buildTestsPrompt, parseTestsResult, buildSonoTargetsPrompt, parseSonoTargetsResult } from '../geminiService';
+
+const BODY_REGION_FAST_TRACK: Partial<Record<BodyRegion, string>> = {
+  cervical: 'cervical',
+  hombro: 'hombro',
+  codo: 'codo',
+  muneca: 'muneca_mano',
+  dorsal: 'dorsal',
+  lumbar: 'lumbar',
+  pelvis: 'pelvis_cadera',
+  muslo: 'muslo',
+  rodilla: 'rodilla',
+  tobillo: 'tobillo',
+  pie: 'pie',
+};
+
+const FAST_TRACK_BODY_REGION = Object.fromEntries(
+  Object.entries(BODY_REGION_FAST_TRACK).map(([bodyRegion, regionId]) => [regionId, bodyRegion]),
+) as Record<string, BodyRegion>;
+
+function detectFastTrackRegions(text: string): FastTrackRegion[] {
+  const normalizedText = ` ${normalizeText(text).replace(/[^\p{L}\p{N}]+/gu, ' ')} `;
+  return Object.values(CLINICAL_FAST_TRACK).filter((fastTrackRegion) =>
+    fastTrackRegion.keywords.some((keyword) => {
+      const normalizedKeyword = normalizeText(keyword).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+      return normalizedText.includes(` ${normalizedKeyword} `);
+    }),
+  );
+}
+
+function createFastTrackTests(
+  regions: FastTrackRegion[],
+  selections: BodyMapSelection[],
+  previous: OrthopedicTest[] = [],
+): OrthopedicTest[] {
+  const previousStaticTests = new Map(
+    previous.filter((test) => test.isStatic).map((test) => [test.id, test]),
+  );
+  return regions.flatMap((fastTrackRegion) => {
+    const selectedSubZones = selections.find((selection) => selection.regionId === fastTrackRegion.id)?.subZones ?? [];
+    const tests = [...fastTrackRegion.tests].sort((a, b) => {
+      const aMatches = a.subZones?.some((zone) => selectedSubZones.includes(zone)) ? 0 : 1;
+      const bMatches = b.subZones?.some((zone) => selectedSubZones.includes(zone)) ? 0 : 1;
+      return aMatches - bMatches;
+    });
+    return tests.map((test) => {
+      const id = `fast-track-${fastTrackRegion.id}-${test.id}`;
+      const matchingSubZones = test.subZones?.filter((zone) => selectedSubZones.includes(zone)) ?? [];
+      return {
+        ...test,
+        id,
+        isStatic: true,
+        regionId: fastTrackRegion.id,
+        region: [fastTrackRegion.name, ...matchingSubZones].join(' · '),
+        position: test.patientPosition,
+        patientPosition: test.patientPosition,
+        maneuver: test.maneuver,
+        positiveCriteria: test.positivityCriteria,
+        positivityCriteria: test.positivityCriteria,
+        result: previousStaticTests.get(id)?.result ?? null,
+      };
+    });
+  });
+}
+
+function createFastTrackQuestions(
+  regions: FastTrackRegion[],
+  selections: BodyMapSelection[],
+  previous: DichotomousFinding[] = [],
+): DichotomousFinding[] {
+  const previousStaticQuestions = new Map(
+    previous.filter((finding) => finding.isStatic).map((finding) => [finding.id, finding]),
+  );
+  return regions.flatMap((fastTrackRegion) => {
+    const selectedSubZones = selections.find((selection) => selection.regionId === fastTrackRegion.id)?.subZones ?? [];
+    const questions = [...fastTrackRegion.questions].sort((a, b) => {
+      const aMatches = a.subZones?.some((zone) => selectedSubZones.includes(zone)) ? 0 : 1;
+      const bMatches = b.subZones?.some((zone) => selectedSubZones.includes(zone)) ? 0 : 1;
+      return aMatches - bMatches;
+    });
+    return questions.map((question) => {
+      const id = `fast-track-${fastTrackRegion.id}-${question.id}`;
+      const previousQuestion = previousStaticQuestions.get(id);
+      return {
+        id,
+        label: question.text,
+        text: question.text,
+        answer: previousQuestion?.answer ?? null,
+        note: previousQuestion?.note ?? '',
+        sourceRegionId: fastTrackRegion.id,
+        isStatic: true,
+      };
+    });
+  });
+}
 
 interface ValorationScreenProps {
   equipment: Record<EquipmentKey, boolean>;
@@ -103,18 +199,46 @@ function answerLabel(answer: string | null | undefined): string {
 export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamnesis, onAnamnesisChange, region, onRegionChange, previousSession, activePatient, activeEpisode, onBackToExpediente, onEpisodeContextChange }: ValorationScreenProps) {
   const isFollowUp = !!(previousSession && previousSession.clinicalData);
   const previousComparable = previousSession?.clinicalData?.comparable;
+  const initialFastTrackId = !isFollowUp && region ? BODY_REGION_FAST_TRACK[region] : undefined;
+  const initialSelectedRegions: BodyMapSelection[] = initialFastTrackId
+    ? [{ regionId: initialFastTrackId, laterality: '', subZones: [] }]
+    : [];
+  const initialTextFastTrackRegions = isFollowUp
+    ? []
+    : detectFastTrackRegions([anamnesis.que, anamnesis.porque, anamnesis.desde].join(' '));
+  const initialActiveRegionIds = new Set([
+    ...initialSelectedRegions.map((selection) => selection.regionId),
+    ...initialTextFastTrackRegions.map((item) => item.id),
+  ]);
+  const initialFastTrackRegions = Object.values(CLINICAL_FAST_TRACK)
+    .filter((item) => initialActiveRegionIds.has(item.id));
   const [anamnesisCollapsed, setAnamnesisCollapsed] = useState(false);
+  const [isLiteMode, setIsLiteMode] = useState(() => {
+    try {
+      return localStorage.getItem('initial_assessment_mode') === 'lite';
+    } catch (error) {
+      console.error('No se pudo leer el modo de valoración guardado:', error);
+      return false;
+    }
+  });
+  const [manualClinicalDiagnosis, setManualClinicalDiagnosis] = useState('');
+  const [manualTreatmentPlan, setManualTreatmentPlan] = useState('');
+  const [manualSonoFindings, setManualSonoFindings] = useState('');
   const [evolucionTejido, setEvolucionTejido] = useState('');
   const [nuevasSensaciones, setNuevasSensaciones] = useState('');
   const [functionalLimitation, setFunctionalLimitation] = useState('');
+  const [openQuestionsNotes, setOpenQuestionsNotes] = useState('');
   const [laterality, setLaterality] = useState('');
   const [subRegion, setSubRegion] = useState('');
+  const [selectedRegions, setSelectedRegions] = useState<BodyMapSelection[]>(initialSelectedRegions);
   const [evaActualPresesion, setEvaActualPresesion] = useState<number | null>(null);
   const [testsNotice, setTestsNotice] = useState<string | null>(null);
   const [redFlags, setRedFlags] = useState<RedFlag[]>(INITIAL_RED_FLAGS);
   const [yellowFlags, setYellowFlags] = useState<YellowFlag[]>(YELLOW_FLAGS);
   const [complementary, setComplementary] = useState('');
-  const [tests, setTests] = useState<OrthopedicTest[]>(INITIAL_TESTS);
+  const [tests, setTests] = useState<OrthopedicTest[]>(() => (
+    isFollowUp ? INITIAL_TESTS : createFastTrackTests(initialFastTrackRegions, initialSelectedRegions)
+  ));
   const [sonoTargets, setSonoTargets] = useState<SonoTargetEntry[]>([]);
   const [sonoTargetsLoading, setSonoTargetsLoading] = useState(false);
   const [sonoTargetsError, setSonoTargetsError] = useState<string | null>(null);
@@ -133,7 +257,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
     forceMode: null,
     instructions: '',
   });
-  const [hypotheses, setHypotheses] = useState<DiagnosticHypothesis[]>(INITIAL_HYPOTHESES);
+  const [hypotheses, setHypotheses] = useState<DiagnosticHypothesis[]>([]);
   const [differentialModal, setDifferentialModal] = useState<DiagnosticHypothesis | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -146,65 +270,94 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
   const [testsError, setTestsError] = useState<string | null>(null);
 
   const [aiDynamicQuestions, setAiDynamicQuestions] = useState<string[] | null>(null);
-  const [dichotomousFindings, setDichotomousFindings] = useState<DichotomousFinding[]>([]);
+  const [dichotomousFindings, setDichotomousFindings] = useState<DichotomousFinding[]>(() => (
+    isFollowUp ? [] : createFastTrackQuestions(initialFastTrackRegions, initialSelectedRegions)
+  ));
   const [equipmentSafetyAnswers, setEquipmentSafetyAnswers] = useState<Record<string, boolean>>({});
   const [expandedNoteId, setExpandedNoteId] = useState<string | null>(null);
 
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessingDictation, setIsProcessingDictation] = useState(false);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
-  const [dictatedText, setDictatedText] = useState('');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
-  const dictatedTextRef = useRef('');
+  const selectedRegionsRef = useRef(selectedRegions);
   const anamnesisRef = useRef(anamnesis);
   const regionRef = useRef(region);
+  useEffect(() => {
+    try {
+      localStorage.setItem('initial_assessment_mode', isLiteMode ? 'lite' : 'complete');
+    } catch (error) {
+      console.error('No se pudo guardar el modo de valoración:', error);
+    }
+  }, [isLiteMode]);
   useEffect(() => { anamnesisRef.current = anamnesis; }, [anamnesis]);
   useEffect(() => { regionRef.current = region; }, [region]);
+  const activeFastTrackRegions = useMemo(() => {
+    if (isFollowUp) return [];
+    const activeIds = new Set([
+      ...detectFastTrackRegions([anamnesis.que, anamnesis.porque, anamnesis.desde].join(' '))
+        .map((item) => item.id),
+      ...selectedRegions.map((selection) => selection.regionId),
+    ]);
+    return Object.values(CLINICAL_FAST_TRACK).filter((item) => activeIds.has(item.id));
+  }, [anamnesis.que, anamnesis.porque, anamnesis.desde, isFollowUp, selectedRegions]);
+  const syncFastTrackData = (
+    text: string,
+    selections: BodyMapSelection[] = selectedRegionsRef.current,
+  ) => {
+    if (isFollowUp) return;
+    const activeRegionIds = new Set([
+      ...detectFastTrackRegions(text).map((item) => item.id),
+      ...selections.map((selection) => selection.regionId),
+    ]);
+    const activeRegions = Object.values(CLINICAL_FAST_TRACK)
+      .filter((item) => activeRegionIds.has(item.id));
+
+    setTests((previous) => {
+      const activeStaticTests = createFastTrackTests(activeRegions, selections, previous);
+      return [...activeStaticTests, ...previous.filter((test) => !test.isStatic)];
+    });
+    setDichotomousFindings((previous) => [
+      ...createFastTrackQuestions(activeRegions, selections, previous),
+      ...previous.filter((finding) => !finding.isStatic),
+    ]);
+  };
   const regionLabel = BODY_REGIONS.find((item) => item.key === region)?.label ?? region ?? '';
   const clinicalRegion = [regionLabel, subRegion, laterality].filter(Boolean).join(' · ') || 'no especificada';
-  const selectRegion = (nextRegion: BodyRegion) => {
+  const selectRegion = (nextRegion: BodyRegion | null) => {
     if (nextRegion !== region) {
       setLaterality('');
       setSubRegion('');
     }
+    regionRef.current = nextRegion;
     onRegionChange(nextRegion);
+    syncFastTrackData([anamnesis.que, anamnesis.porque, anamnesis.desde].join(' '));
   };
 
-  const validRegions: BodyRegion[] = ['cervical','hombro','codo','muneca','dorsal','lumbar','pelvis','muslo','rodilla','tobillo','pie'];
+  const updateSelectedRegions = (nextSelections: BodyMapSelection[]) => {
+    selectedRegionsRef.current = nextSelections;
+    setSelectedRegions(nextSelections);
+    const selected = nextSelections[nextSelections.length - 1];
+    const primaryRegion = selected ? FAST_TRACK_BODY_REGION[selected.regionId] ?? null : null;
+    regionRef.current = primaryRegion;
+    onRegionChange(primaryRegion);
+    setLaterality(selected?.laterality ?? '');
+    setSubRegion(selected?.subZones[selected.subZones.length - 1] ?? '');
+    syncFastTrackData(
+      [anamnesisRef.current.que, anamnesisRef.current.porque, anamnesisRef.current.desde].join(' '),
+      nextSelections,
+    );
+  };
 
-  const handleExtractAnamnesis = async (rawText?: string) => {
-    const textToProcess = (rawText ?? dictatedTextRef.current).trim();
-    if (!textToProcess || textToProcess.length === 0) return;
-    console.log('Enviando texto a Gemini:', textToProcess);
-    setIsProcessingDictation(true);
-    setTranscriptError(null);
-    try {
-      const prompt = buildTranscriptPrompt(textToProcess);
-      const raw = await callGemini(prompt, geminiConfig);
-      const result: TranscriptResult = parseTranscriptResult(raw);
-      const prev = anamnesisRef.current;
-      onAnamnesisChange({
-        que: result.queOcurre || prev.que,
-        porque: result.aQueLoAchacas || prev.porque,
-        desde: result.desdeCuando || prev.desde,
-      });
-      if (result.regionSugerida) {
-        const matched = validRegions.find((r) => r === result.regionSugerida.toLowerCase().trim());
-        if (matched) selectRegion(matched);
-      }
-    } catch (err) {
-      console.error('Error al extraer anamnesis con Gemini:', err);
-      setTranscriptError(err instanceof Error ? err.message : 'Error al procesar la transcripción.');
-      const prev = anamnesisRef.current;
-      onAnamnesisChange({
-        ...prev,
-        que: prev.que ? prev.que + ' ' + textToProcess : textToProcess,
-      });
-    } finally {
-      setIsProcessingDictation(false);
-    }
+  const updateAnamnesis = (nextAnamnesis: Anamnesis) => {
+    anamnesisRef.current = nextAnamnesis;
+    onAnamnesisChange(nextAnamnesis);
+    syncFastTrackData(
+      [nextAnamnesis.que, nextAnamnesis.porque, nextAnamnesis.desde].join(' '),
+      selectedRegionsRef.current,
+    );
   };
 
   const toggleRecording = () => {
@@ -239,15 +392,13 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
         audioBlob.type || 'audio/webm',
         geminiConfig,
       );
-      dictatedTextRef.current = result.rawTranscript;
-      setDictatedText(result.rawTranscript);
 
       if (isFollowUp) {
         setEvolucionTejido(result.rawTranscript);
         setNuevasSensaciones(result.followUpNotes || result.whatHappens || result.rawTranscript);
       } else {
         const previous = anamnesisRef.current;
-        onAnamnesisChange({
+        updateAnamnesis({
           que: result.whatHappens || result.rawTranscript || previous.que,
           porque: result.cause || previous.porque,
           desde: result.duration || previous.desde,
@@ -355,6 +506,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
   useEffect(() => {
     if (!previousSession?.clinicalData) return;
     const cd = previousSession.clinicalData as ClinicalSessionData;
+    setOpenQuestionsNotes(cd.openQuestionsNotes ?? '');
     setEvolucionTejido(cd.evolution?.tissueResponse ?? '');
     setNuevasSensaciones(cd.evolution?.perceivedChanges ?? '');
     setFunctionalLimitation(cd.evolution?.functionalLimitation ?? '');
@@ -427,9 +579,14 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
     }
   }, [previousSession, onRegionChange]);
 
-  const dynamicQuestions = aiDynamicQuestions ?? (region
-    ? DYNAMIC_QUESTIONS[region] || DYNAMIC_QUESTIONS.default
-    : DYNAMIC_QUESTIONS.default);
+  const dynamicQuestions = useMemo(
+    () => isFollowUp
+      ? aiDynamicQuestions ?? (region
+        ? DYNAMIC_QUESTIONS[region] || DYNAMIC_QUESTIONS.default
+        : DYNAMIC_QUESTIONS.default)
+      : aiDynamicQuestions ?? [],
+    [aiDynamicQuestions, isFollowUp, region],
+  );
   const equipmentSafety = useMemo<EquipmentSafetyCheck[]>(() => {
     const safetyQuestions = [
       {
@@ -561,9 +718,14 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
   // Lift clinical data to parent for report generation
   useEffect(() => {
     onDataChange({
+      isLiteMode,
       anamnesis,
+      manualClinicalDiagnosis,
+      manualTreatmentPlan,
+      manualSonoFindings,
       region: clinicalRegion,
       dynamicQuestions,
+      openQuestionsNotes,
       dichotomousFindings: dichotomousFindings.map((f) => ({
         label: f.label,
         answer: f.answer ?? 'sin responder',
@@ -578,6 +740,13 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
       complementary,
       tests: tests.map((t) => ({
         name: t.name,
+        region: t.region,
+        description: t.description,
+        position: t.position,
+        maneuver: t.maneuver,
+        positiveCriteria: t.positiveCriteria,
+        sensitivity: t.sensitivity,
+        specificity: t.specificity,
         result: t.result || 'sin valorar',
         needsRetest: t.needsRetest,
         retestReason: t.retestReason,
@@ -609,7 +778,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           }
         : undefined,
     });
-  }, [anamnesis, clinicalRegion, dynamicQuestions, dichotomousFindings, redFlags, yellowFlags, complementary, tests, sonoTargets, freeExploration, hypotheses, comparable, evaActualPresesion, aiPrognosis, aiTreatment, equipment, equipmentSafety, previousSession, isFollowUp, previousComparable, evolucionTejido, nuevasSensaciones, functionalLimitation, onDataChange]);
+  }, [isLiteMode, anamnesis, manualClinicalDiagnosis, manualTreatmentPlan, manualSonoFindings, clinicalRegion, dynamicQuestions, openQuestionsNotes, dichotomousFindings, redFlags, yellowFlags, complementary, tests, sonoTargets, freeExploration, hypotheses, comparable, evaActualPresesion, aiPrognosis, aiTreatment, equipment, equipmentSafety, previousSession, isFollowUp, previousComparable, evolucionTejido, nuevasSensaciones, functionalLimitation, onDataChange]);
 
   useEffect(() => {
     if (!onEpisodeContextChange || !activeEpisode?.id) return;
@@ -670,6 +839,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
         region: clinicalRegion,
         anamnesis,
         testResults,
+        openQuestionsNotes,
       });
       const raw = await callGemini(prompt, geminiConfig);
       const result = parseSonoTargetsResult(raw);
@@ -718,6 +888,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
     }
     setAiLoading(true);
     setAiError(null);
+    setAiPrognosis(null);
     try {
       const testResults = tests
         .map((t) => `${t.name}: ${t.result || 'sin valorar'}`)
@@ -761,6 +932,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             .map((test) => `${test.name}: ${test.previousResult} → ${test.evolutionStatus}`),
         ].join('; '),
         equipmentSafety,
+        openQuestionsNotes,
       });
 
       const raw = await callGemini(prompt, geminiConfig, {
@@ -856,7 +1028,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             .map((finding) => `${finding.label}: ${finding.answer}`)
             .join('; ')
         : '';
-      const prompt = buildTriajePrompt(anamnesis, clinicalRegion, isFollowUp, priorFindings, priorTests, evolucionTejido, nuevasSensaciones, reevaluationCandidates);
+      const prompt = buildTriajePrompt(anamnesis, clinicalRegion, isFollowUp, priorFindings, priorTests, evolucionTejido, nuevasSensaciones, reevaluationCandidates, openQuestionsNotes);
       const raw = await callGemini(prompt, geminiConfig, {
         responseSchema: TRIAJE_RESPONSE_SCHEMA,
         maxOutputTokens: TRIAJE_MAX_OUTPUT_TOKENS,
@@ -877,18 +1049,21 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
       }
       if (result.dynamicQuestions.length > 0) {
         setAiDynamicQuestions((previous) => {
-          const current = isFollowUp ? previous ?? dynamicQuestions : [];
-          const existingLabels = new Set(current.map((question) => normalizeText(question)));
+          const current = isFollowUp ? previous ?? dynamicQuestions : previous ?? [];
+          const existingLabels = new Set(
+            [
+              ...(isFollowUp ? [] : activeFastTrackRegions.flatMap((item) => item.questions.map((question) => question.text))),
+              ...current,
+            ]
+              .map((question) => normalizeText(question)),
+          );
           const additions = result.dynamicQuestions.filter((question) => {
             const normalized = normalizeText(question);
             if (existingLabels.has(normalized)) return false;
             existingLabels.add(normalized);
             return true;
           });
-          return [
-            ...current,
-            ...additions,
-          ];
+          return isFollowUp ? [...current, ...additions] : [...(previous ?? []), ...additions];
         });
       }
       const suggestedFindings = result.dichotomousFindings.length > 0
@@ -908,13 +1083,23 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             .map((f) => ({ ...f, answer: null as DichotomousAnswer, note: '' }));
           setDichotomousFindings((prev) => [...prev, ...newFindings]);
         } else {
-          setDichotomousFindings(
-            suggestedFindings.map((f) => ({
-              ...f,
-              answer: null as DichotomousAnswer,
-              note: '',
-            })),
-          );
+          setDichotomousFindings((previous) => {
+            const existingLabels = new Set(previous.map((finding) => normalizeText(finding.label)));
+            const newFindings = suggestedFindings
+              .filter((finding) => {
+                const normalized = normalizeText(finding.label);
+                if (existingLabels.has(normalized)) return false;
+                existingLabels.add(normalized);
+                return true;
+              })
+              .map((finding, index) => ({
+                ...finding,
+                id: `${finding.id}-${Date.now()}-${index}`,
+                answer: null as DichotomousAnswer,
+                note: '',
+              }));
+            return [...previous, ...newFindings];
+          });
         }
       }
       if (result.redFlags.length > 0 && !isFollowUp) setRedFlags(result.redFlags as RedFlag[]);
@@ -942,17 +1127,27 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
         : '';
       const prompt = buildTestsPrompt({
         anamnesis,
-        region: clinicalRegion,
+        region: isFollowUp
+          ? clinicalRegion
+          : [...new Set(tests.map((test) => test.region).filter(Boolean))].join('; ') || clinicalRegion,
         positiveFindings,
         negativeFindings,
+        candidateTests: isFollowUp ? [] : tests.map((test) => ({
+          name: test.name,
+          region: test.region,
+          description: test.description,
+          sensitivity: test.sensitivity,
+          specificity: test.specificity,
+        })),
         isFollowUp,
         priorTests,
         evolucionTejido,
         nuevasSensaciones,
         reevaluationCandidates: retestCandidates,
+        openQuestionsNotes,
       });
       const raw = await callGemini(prompt, geminiConfig, {
-        responseSchema: TESTS_RESPONSE_SCHEMA,
+        responseSchema: isFollowUp ? TESTS_FOLLOW_UP_RESPONSE_SCHEMA : TESTS_RESPONSE_SCHEMA,
         maxOutputTokens: TESTS_MAX_OUTPUT_TOKENS,
       });
       console.log('RESPUESTA BRUTA DE GEMINI (tests):', raw);
@@ -970,9 +1165,12 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
         }));
       }
       if (result.orthopedicTests.length > 0) {
-        const suggestedTests = result.orthopedicTests.map((test, index) => ({
+        const uniqueSuggestedTests = result.orthopedicTests.filter((test, index, all) =>
+          all.findIndex((candidate) => normalizeText(candidate.name) === normalizeText(test.name)) === index,
+        );
+        const suggestedTests = uniqueSuggestedTests.slice(0, isFollowUp ? 3 : 6).map((test, index) => ({
           ...test,
-          id: `ai-test-${Date.now()}-${index}`,
+          id: test.id || `ai-test-${Date.now()}-${index}`,
           result: null as TestResult,
         }));
         if (isFollowUp) {
@@ -991,7 +1189,33 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             setTestsNotice('Exploración basal consolidada; monitorizar mediante Signo Asterisco.');
           }
         } else {
-          setTests(suggestedTests);
+          setTests((previous) => {
+            const existingByName = new Map(previous.map((test) => [normalizeText(test.name), test]));
+            const mergedSuggestions = suggestedTests.map((suggestion) => {
+              const existing = existingByName.get(normalizeText(suggestion.name));
+              if (!existing) return suggestion;
+              if (existing.result !== null) return existing;
+              return {
+                ...existing,
+                ...suggestion,
+                id: existing.id,
+                isStatic: existing.isStatic,
+                regionId: existing.regionId,
+                result: existing.result,
+                description: suggestion.description || existing.description,
+                position: suggestion.position || existing.position,
+                maneuver: suggestion.maneuver || existing.maneuver,
+                positiveCriteria: suggestion.positiveCriteria || existing.positiveCriteria,
+                sensitivity: existing.isStatic ? existing.sensitivity : suggestion.sensitivity || existing.sensitivity,
+                specificity: existing.isStatic ? existing.specificity : suggestion.specificity || existing.specificity,
+              };
+            });
+            const selectedNames = new Set(mergedSuggestions.map((test) => normalizeText(test.name)));
+            const evaluatedTestsNotSelected = previous.filter((test) =>
+              test.result !== null && !selectedNames.has(normalizeText(test.name)),
+            );
+            return [...evaluatedTestsNotSelected, ...mergedSuggestions];
+          });
         }
       } else if (isFollowUp) {
         setTestsNotice('Exploración basal consolidada; monitorizar mediante Signo Asterisco.');
@@ -1048,6 +1272,38 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           No se pudo actualizar el nombre o la región del episodio: {episodeContextError}
         </p>
       )}
+      <div className="flex flex-col gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-800">Modo de valoración inicial</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            {isLiteMode
+              ? 'Historia clínica manual con FastTrack, banderas y dictado activos.'
+              : 'Valoración completa con sugerencias y análisis de IA.'}
+          </p>
+        </div>
+        <div className="inline-flex rounded-xl bg-slate-100 p-1" role="group" aria-label="Modo clínico">
+          <button
+            type="button"
+            aria-pressed={!isLiteMode}
+            onClick={() => setIsLiteMode(false)}
+            className={`rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+              !isLiteMode ? 'bg-white text-primary-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            Modo Completo (IA Activa)
+          </button>
+          <button
+            type="button"
+            aria-pressed={isLiteMode}
+            onClick={() => setIsLiteMode(true)}
+            className={`rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+              isLiteMode ? 'bg-white text-primary-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            Modo Lite (Solo Historia)
+          </button>
+        </div>
+      </div>
       {/* Step 1: Anamnesis + Body Map */}
       <Card>
         <CardHeader
@@ -1088,28 +1344,6 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                   <span className="text-xs text-error-600">{transcriptError}</span>
                 )}
               </div>
-              {(dictatedText || isRecording) && (
-                <div className="space-y-2">
-                  <textarea
-                    value={dictatedText}
-                    onChange={(e) => {
-                      setDictatedText(e.target.value);
-                      dictatedTextRef.current = e.target.value;
-                    }}
-                    rows={3}
-                    placeholder="Texto transcrito del dictado…"
-                    className="w-full resize-y rounded-xl border border-slate-200 px-4 py-2.5 text-sm text-slate-700 outline-none focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleExtractAnamnesis()}
-                    disabled={dictatedText.trim().length <= 5 || isProcessingDictation || !geminiConfig.apiKey}
-                    className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary-600 to-primary-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-all hover:shadow-md disabled:cursor-not-allowed disabled:opacity-40"
-                  >
-                    <Sparkles className="h-4 w-4" /> Auto-completar Anamnesis con IA
-                  </button>
-                </div>
-              )}
             </div>
 
             {/* Follow-up badge */}
@@ -1139,19 +1373,19 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                   label="¿Qué te ocurre?"
                   placeholder="Describe el síntoma principal y su localización…"
                   value={anamnesis.que}
-                  onChange={(v) => onAnamnesisChange({ ...anamnesis, que: v })}
+                  onChange={(v) => updateAnamnesis({ ...anamnesis, que: v })}
                 />
                 <SpeechBubble
                   label="¿A qué lo achacas?"
                   placeholder="Mecanismo de lesión, trauma o forma de inicio…"
                   value={anamnesis.porque}
-                  onChange={(v) => onAnamnesisChange({ ...anamnesis, porque: v })}
+                  onChange={(v) => updateAnamnesis({ ...anamnesis, porque: v })}
                 />
                 <SpeechBubble
                   label="¿Desde cuándo?"
                   placeholder="Temporalidad: agudo (<6 sem), subagudo (6-12 sem), crónico (>12 sem)…"
                   value={anamnesis.desde}
-                  onChange={(v) => onAnamnesisChange({ ...anamnesis, desde: v })}
+                  onChange={(v) => updateAnamnesis({ ...anamnesis, desde: v })}
                 />
               </>
             )}
@@ -1220,6 +1454,10 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             <BodyMap
               selected={region}
               onSelect={selectRegion}
+              allowDeselect={!isFollowUp}
+              multiSelect={!isFollowUp}
+              selectedRegions={selectedRegions}
+              onSelectedRegionsChange={updateSelectedRegions}
               laterality={laterality}
               onLateralityChange={setLaterality}
               subRegion={subRegion}
@@ -1228,7 +1466,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           </div>
         </div>
         {/* Button 1: Suggest clinical questions + triaje */}
-        <div className="flex flex-col items-start gap-3 border-t border-slate-100 p-5 pt-4">
+        {!isLiteMode && <div className="flex flex-col items-start gap-3 border-t border-slate-100 p-5 pt-4">
           <div className="flex items-center gap-3">
             <Button
               onClick={handleTriaje}
@@ -1257,7 +1495,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           <p className="text-xs text-slate-400">
             Envía la anamnesis y región a Gemini para generar banderas rojas/amarillas y preguntas Sí/No de sospecha fenotípica.
           </p>
-        </div>
+        </div>}
       </Card>
       <Card>
         <CardHeader
@@ -1267,6 +1505,34 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           icon={<MessageSquareText className="h-5 w-5" />}
         />
         <div className="space-y-6 p-5">
+          {!isLiteMode && !isFollowUp && dynamicQuestions.length > 0 && (
+            <div>
+              <h4 className="mb-2 text-sm font-semibold text-slate-800">Preguntas sugeridas</h4>
+              <div className="flex flex-wrap gap-2">
+                {dynamicQuestions.map((question) => (
+                  <span
+                    key={question}
+                    className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-500"
+                  >
+                    {question}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div>
+            <label htmlFor="open-questions-notes" className="mb-2 block text-sm font-semibold text-slate-800">
+              Respuestas a preguntas abiertas y notas de la entrevista
+            </label>
+            <textarea
+              id="open-questions-notes"
+              value={openQuestionsNotes}
+              onChange={(event) => setOpenQuestionsNotes(event.target.value)}
+              rows={4}
+              placeholder="Anota aquí lo que responda el paciente a las preguntas abiertas (patrón horario, tipo de dolor, gestos que alivian/empeoran) o cualquier matiz adicional..."
+              className="w-full resize-y rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
+            />
+          </div>
           {/* Dichotomous Findings (Yes/No affirmations) */}
           <div className="mt-3 rounded-lg border border-primary-200 bg-white px-3 py-2 text-xs text-primary-800">
             Signo Asterisco de referencia (fijo): <strong>{previousComparable?.movement || comparable.movement}</strong>
@@ -1332,7 +1598,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                   );
                 })}
               </div>
-            ) : (
+            ) : isLiteMode ? null : isFollowUp ? (
               <div className="flex flex-wrap gap-2">
                 {dynamicQuestions.map((q) => (
                   <span
@@ -1346,50 +1612,11 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                   Pulsa “Sugerir Preguntas Clínicas y Triaje” para generar afirmaciones interactivas Sí/No.
                 </p>
               </div>
+            ) : (
+              <p className="text-xs text-slate-400">
+                Pulsa “Sugerir Preguntas Clínicas y Triaje” para generar afirmaciones interactivas Sí/No.
+              </p>
             )}
-          </div>
-
-          {/* Button 2: Suggest orthopedic tests based on answers */}
-          <div className="flex flex-col items-start gap-3 rounded-xl bg-gradient-to-r from-primary-50 to-secondary-50 p-4">
-            <div className="flex items-center gap-3">
-              <Button
-                onClick={handleSuggestTests}
-                disabled={testsLoading || !geminiConfig.apiKey || dichotomousFindings.length === 0}
-                size="lg"
-              >
-                {testsLoading ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" /> Generando tests…
-                  </>
-                ) : (
-                  <>
-                    <Stethoscope className="h-4 w-4" /> Sugerir Tests Ortopédicos y Funcionales
-                  </>
-                )}
-              </Button>
-              {testsError && (
-                <p className="text-xs text-error-600">{testsError}</p>
-              )}
-              {!geminiConfig.apiKey && !testsError && (
-                <p className="text-xs text-slate-400">
-                  Sin API key configurada.
-                </p>
-              )}
-              {geminiConfig.apiKey && dichotomousFindings.length === 0 && !testsError && (
-                <p className="text-xs text-slate-400">
-                  Responde primero las preguntas Sí/No para activar este paso.
-                </p>
-              )}
-              {testsNotice && (
-                <div className="flex items-center gap-2 rounded-lg border border-secondary-100 bg-secondary-50 px-3 py-2">
-                  <Stethoscope className="h-3.5 w-3.5 shrink-0 text-secondary-500" />
-                  <p className="text-xs font-medium text-secondary-700">{testsNotice}</p>
-                </div>
-              )}
-            </div>
-            <p className="text-xs text-slate-400">
-              Usa las respuestas Sí/No para generar tests físicos específicos dirigidos a confirmar o descartar la sospecha clínica.
-            </p>
           </div>
 
           {/* Red & Yellow Flags */}
@@ -1493,25 +1720,29 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                 </div>
                 <div className="space-y-2">
                   {equipmentSafety.map((check) => (
-                    <div key={check.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white bg-white p-3">
-                      <span className="text-sm text-slate-700">{check.label}</span>
-                      {check.present === null && <span className="text-[10px] font-medium text-amber-700">Pendiente de valorar</span>}
-                      <div className="flex gap-1.5">
-                        {[false, true].map((present) => (
-                          <button
-                            type="button"
-                            key={String(present)}
-                            aria-pressed={check.present === present}
-                            onClick={() => setEquipmentSafetyAnswers((current) => ({ ...current, [check.id]: present }))}
-                            className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
-                              check.present === present
-                                ? present ? 'border-error-500 bg-error-600 text-white' : 'border-success-500 bg-success-600 text-white'
-                                : 'border-slate-200 bg-white text-slate-500'
-                            }`}
-                          >
-                            {present ? 'Presente / Sí' : 'Descartado'}
-                          </button>
-                        ))}
+                    <div key={check.id} className="flex flex-col gap-2 rounded-lg border border-white bg-white p-3">
+                      <span className="w-full text-sm text-slate-700">{check.label}</span>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={`text-[10px] font-medium ${check.present === null ? 'text-amber-700' : 'text-slate-500'}`}>
+                          {check.present === null ? 'Pendiente de valorar' : 'Revisado'}
+                        </span>
+                        <div className="flex shrink-0 gap-1.5">
+                          {[false, true].map((present) => (
+                            <button
+                              type="button"
+                              key={String(present)}
+                              aria-pressed={check.present === present}
+                              onClick={() => setEquipmentSafetyAnswers((current) => ({ ...current, [check.id]: present }))}
+                              className={`rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                                check.present === present
+                                  ? present ? 'border-error-500 bg-error-600 text-white' : 'border-success-500 bg-success-600 text-white'
+                                  : 'border-slate-200 bg-white text-slate-500'
+                              }`}
+                            >
+                              {present ? 'Presente / Sí' : 'Descartado'}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                       {check.present && (
                         <div role="alert" className="grid w-full gap-2 sm:grid-cols-2">
@@ -1557,6 +1788,41 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
           icon={<Stethoscope className="h-5 w-5" />}
         />
         <div className="space-y-6 p-5">
+          {!isLiteMode && <div className="flex flex-col items-start gap-3 rounded-xl bg-gradient-to-r from-primary-50 to-secondary-50 p-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={handleSuggestTests}
+                disabled={testsLoading || !geminiConfig.apiKey || dichotomousFindings.length === 0}
+                size="lg"
+              >
+                {testsLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" /> Generando tests…
+                  </>
+                ) : (
+                  <>
+                    <Stethoscope className="h-4 w-4" /> Sugerir Tests Ortopédicos y Funcionales
+                  </>
+                )}
+              </Button>
+              {testsError && <p className="text-xs text-error-600">{testsError}</p>}
+              {!geminiConfig.apiKey && !testsError && (
+                <p className="text-xs text-slate-400">Sin API key configurada.</p>
+              )}
+              {geminiConfig.apiKey && dichotomousFindings.length === 0 && !testsError && (
+                <p className="text-xs text-slate-400">Responde primero las preguntas Sí/No para activar este paso.</p>
+              )}
+              {testsNotice && (
+                <div className="flex items-center gap-2 rounded-lg border border-secondary-100 bg-secondary-50 px-3 py-2">
+                  <Stethoscope className="h-3.5 w-3.5 shrink-0 text-secondary-500" />
+                  <p className="text-xs font-medium text-secondary-700">{testsNotice}</p>
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-slate-400">
+              Usa las respuestas Sí/No y las notas de la entrevista para sugerir tests físicos dirigidos a la sospecha clínica.
+            </p>
+          </div>}
           {/* Complementary Tests */}
           <div>
             <h4 className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-800">
@@ -1574,7 +1840,9 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
 
           {/* Orthopedic Tests */}
           <div>
-            <h4 className="mb-3 text-sm font-semibold text-slate-800">Tests Ortopédicos Sugeridos</h4>
+            <h4 className="mb-3 text-sm font-semibold text-slate-800">
+              {isLiteMode ? 'Tests Ortopédicos Rápidos' : 'Tests Ortopédicos Sugeridos'}
+            </h4>
             {isFollowUp && consolidatedTestNames.size > 0 && (
               <p className="mb-2 text-xs text-secondary-700">
                 Los tests con resultado de la valoración inicial se conservan; se añaden hasta dos propuestas nuevas.
@@ -1598,6 +1866,8 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                 <Badge variant="primary">Ecógrafo activo</Badge>
               </div>
 
+              {!isLiteMode ? (
+                <>
               <button
                 type="button"
                 onClick={handleSuggestSonoTargets}
@@ -1675,6 +1945,22 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                   ))}
                 </div>
               )}
+                </>
+              ) : (
+                <div>
+                  <label htmlFor="manual-sono-findings" className="mb-2 block text-sm font-semibold text-slate-800">
+                    Hallazgos ecográficos y sonoanatomía
+                  </label>
+                  <textarea
+                    id="manual-sono-findings"
+                    value={manualSonoFindings}
+                    onChange={(event) => setManualSonoFindings(event.target.value)}
+                    rows={4}
+                    placeholder="Describe la sonoanatomía observada, las estructuras exploradas y los hallazgos ecográficos."
+                    className="w-full resize-y rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition-colors focus:border-secondary-400 focus:ring-2 focus:ring-secondary-100"
+                  />
+                </div>
+              )}
             </div>
           )}
 
@@ -1688,7 +1974,9 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
               value={freeExploration}
               onChange={(e) => setFreeExploration(e.target.value)}
               rows={3}
-              placeholder="Registra cualquier test o hallazgo manual no contemplado por la IA…"
+              placeholder={isLiteMode
+                ? 'Anota otros hallazgos observados durante la exploración física.'
+                : 'Registra cualquier test o hallazgo manual no contemplado por la IA…'}
               className="w-full resize-y rounded-xl border border-slate-200 px-4 py-3 text-sm text-slate-700 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
             />
           </div>
@@ -1699,11 +1987,14 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
       <Card>
         <CardHeader
           step={4}
-          title="Resolución: Hipótesis, Signo Comparable y Pronóstico"
-          description="Recálculo con IA, diagnóstico, test-retest y propuesta de tratamiento"
-          icon={<Brain className="h-5 w-5" />}
+          title={isLiteMode ? 'Diagnóstico y Plan de Tratamiento' : 'Resolución: Hipótesis, Signo Comparable y Pronóstico'}
+          description={isLiteMode
+            ? 'Registro manual del diagnóstico, Signo Asterisco y técnicas aplicadas'
+            : 'Recálculo con IA, diagnóstico, test-retest y propuesta de tratamiento'}
+          icon={isLiteMode ? <Stethoscope className="h-5 w-5" /> : <Brain className="h-5 w-5" />}
         />
         <div className="space-y-6 p-5">
+          {!isLiteMode && <>
           {/* AI Recalculate Button */}
           <div className="flex flex-col items-start gap-3 rounded-xl bg-gradient-to-r from-primary-50 to-secondary-50 p-4">
             <div className="flex items-center gap-2">
@@ -1738,11 +2029,49 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
               )}
             </div>
           </div>
+          </>}
+
+          {isLiteMode && (
+            <div className="grid gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div>
+                <label htmlFor="manual-clinical-diagnosis" className="mb-2 block text-sm font-semibold text-slate-800">
+                  Diagnóstico Fisioterápico
+                </label>
+                <textarea
+                  id="manual-clinical-diagnosis"
+                  value={manualClinicalDiagnosis}
+                  onChange={(event) => setManualClinicalDiagnosis(event.target.value)}
+                  rows={3}
+                  placeholder="Escribe el diagnóstico fisioterápico valorado."
+                  className="w-full resize-y rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
+                />
+              </div>
+              <div>
+                <label htmlFor="manual-treatment-plan" className="mb-2 block text-sm font-semibold text-slate-800">
+                  Plan de Tratamiento / Técnicas Aplicadas
+                </label>
+                <textarea
+                  id="manual-treatment-plan"
+                  value={manualTreatmentPlan}
+                  onChange={(event) => setManualTreatmentPlan(event.target.value)}
+                  rows={4}
+                  placeholder="Registra el plan acordado o las técnicas aplicadas."
+                  className="w-full resize-y rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Hypotheses */}
+          {!isLiteMode && <>
           <div>
             <h4 className="mb-3 text-sm font-semibold text-slate-800">Hipótesis Diagnósticas</h4>
-            <div className="grid gap-4 md:grid-cols-3">
+            {hypotheses.length === 0 ? (
+              <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-sm text-slate-500">
+                Pendiente de valoración clínica y generación.
+              </p>
+            ) : (
+              <div className="grid gap-4 md:grid-cols-3">
               {[...hypotheses]
                 .sort((a, b) => (b.isPrimary ? 1 : 0) - (a.isPrimary ? 1 : 0))
                 .map((h) => (
@@ -1789,8 +2118,10 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                     )}
                   </div>
                 ))}
-            </div>
+              </div>
+            )}
           </div>
+          </>}
 
           {/* Comparable Sign / Asterisk */}
           <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4">
@@ -1799,7 +2130,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
               <h4 className="text-sm font-semibold text-slate-800">
                 Signo Asterisco / Signo Comparable (Test-Retest)
               </h4>
-              {comparable.instructions && (
+              {!isLiteMode && comparable.instructions && (
                 <Badge variant="primary">
                   <Brain className="h-3 w-3" /> Auto-generado por IA
                 </Badge>
@@ -1813,7 +2144,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             <div className="space-y-4">
               <div>
                 <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-slate-400">
-                  Gesto Funcional Diana
+                  {isLiteMode ? 'Signo Asterisco de Referencia' : 'Gesto Funcional Diana'}
                 </label>
                 <input
                   value={comparable.movement}
@@ -2128,6 +2459,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
             </div>
           </div>
 
+          {!isLiteMode && <>
           {/* Prognosis */}
           <div className="rounded-xl border border-slate-200 bg-gradient-to-br from-slate-50 to-white p-5">
             <div className="mb-4 flex items-center gap-2">
@@ -2141,7 +2473,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                 </Badge>
               )}
             </div>
-            {aiPrognosis && (
+            {aiPrognosis?.text && (
               <div className="mb-4 grid gap-3 sm:grid-cols-2">
                 <div className="rounded-lg border border-primary-100 bg-primary-50/50 p-3">
                   <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-primary-700">Pronóstico</p>
@@ -2155,29 +2487,33 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
                 )}
               </div>
             )}
-            {(!aiPrognosis || hasAiGradePrognosis) && (
+            {hasAiGradePrognosis && aiPrognosis && (
               <div className="grid gap-3 md:grid-cols-3">
-                {(aiPrognosis ? [
+                {[
                 { grade: 'Grado I', timeline: '', title: aiPrognosis.grade1, explanation: '' },
                 { grade: 'Grado II', timeline: '', title: aiPrognosis.grade2, explanation: '' },
                 { grade: 'Grado III', timeline: '', title: aiPrognosis.grade3, explanation: '' },
-              ] : PROGNOSIS_GRADES).map((g, idx) => (
+              ].filter((grade) => grade.title).map((g, idx) => (
                 <div key={g.grade + idx} className="rounded-lg border border-slate-200 bg-white p-4">
                   <div className="flex items-center justify-between">
                     <span className="rounded-full bg-secondary-100 px-2.5 py-0.5 text-xs font-bold text-secondary-700">
                       {g.grade}
                     </span>
-                    {g.timeline && <span className="text-xs font-medium text-slate-500">{g.timeline}</span>}
                   </div>
                   <h5 className="mt-2 text-sm font-semibold text-slate-700">
-                    {aiPrognosis ? g.title.split(':')[0] : g.title}
+                    {g.title.split(':')[0]}
                   </h5>
                   <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
-                    {aiPrognosis ? g.title : g.explanation}
+                    {g.title}
                   </p>
                 </div>
               ))}
               </div>
+            )}
+            {!aiPrognosis?.text && !aiPrognosis?.recoveryTime && !hasAiGradePrognosis && (
+              <p className="rounded-lg border border-dashed border-slate-200 bg-white/70 px-4 py-5 text-sm text-slate-500">
+                Pendiente de generación tras la valoración clínica.
+              </p>
             )}
           </div>
 
@@ -2194,6 +2530,7 @@ export function ValorationScreen({ equipment, geminiConfig, onDataChange, anamne
               <p className="text-sm leading-relaxed text-slate-600">{aiTreatment}</p>
             </div>
           )}
+          </>}
         </div>
       </Card>
 
@@ -2266,23 +2603,25 @@ function DichotomousChip({
           <button
             type="button"
             onClick={() => onAnswer('yes')}
-            className={`flex h-8 w-12 items-center justify-center rounded-lg text-xs font-bold transition-all ${
+            className={`flex h-8 min-w-12 items-center justify-center gap-1 rounded-lg px-2 text-xs font-bold transition-all ${
               isYes
                 ? 'bg-emerald-600 text-white shadow-sm'
                 : 'border border-slate-200 bg-white text-slate-500 hover:border-emerald-400 hover:text-emerald-600'
             }`}
           >
+            {finding.isStatic && <Check className="h-3.5 w-3.5" aria-hidden="true" />}
             Sí
           </button>
           <button
             type="button"
             onClick={() => onAnswer('no')}
-            className={`flex h-8 w-12 items-center justify-center rounded-lg text-xs font-bold transition-all ${
+            className={`flex h-8 min-w-12 items-center justify-center gap-1 rounded-lg px-2 text-xs font-bold transition-all ${
               isNo
                 ? 'bg-rose-600 text-white shadow-sm'
                 : 'border border-slate-200 bg-white text-slate-500 hover:border-rose-400 hover:text-rose-600'
             }`}
           >
+            {finding.isStatic && <X className="h-3.5 w-3.5" aria-hidden="true" />}
             No
           </button>
           <button

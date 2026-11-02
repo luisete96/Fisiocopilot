@@ -3,26 +3,28 @@ import {
   Calendar, Plus, User, TrendingUp, Activity,
   ClipboardList, ChevronDown, FileText,
   Copy, Printer, X, Stethoscope, AlertTriangle, Target,
-  ClipboardCheck, Lightbulb, FolderPlus, Folder, Pencil, Save,
+  ClipboardCheck, Lightbulb, FolderPlus, Folder, Pencil, Save, Loader2,
 } from 'lucide-react';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Area, ComposedChart,
+  ResponsiveContainer, ReferenceLine, ComposedChart, Line,
 } from 'recharts';
-import type { SessionEntry, EquipmentKey, Patient, Episode, ClinicalSessionData, ClinicalReportResult } from '../types';
+import type { SessionEntry, EquipmentKey, Patient, Episode, ClinicalSessionData, ClinicalReportResult, GeminiConfig } from '../types';
 import { EQUIPMENT, BODY_REGIONS } from '../mockData';
+import { callGemini } from '../geminiService';
 import { Card, CardHeader } from './ui/Card';
 import { Button } from './ui/Button';
 import { Badge } from './ui/Badge';
 import { Modal } from './ui/Modal';
 import { EpisodeStatusControl } from './EpisodeStatusControl';
-import { normalizeText } from '../patientUtils';
+import { isEpisodeActive, normalizeText } from '../patientUtils';
 
 interface ExpedienteScreenProps {
   sessions: SessionEntry[];
   onAddSession: (session: SessionEntry) => void;
   equipment: Record<EquipmentKey, boolean>;
   physio: string;
+  geminiConfig: GeminiConfig;
   activePatient?: Patient | null;
   activeEpisode?: Episode | null;
   episodes?: Episode[];
@@ -33,10 +35,11 @@ interface ExpedienteScreenProps {
   onSaveClinicalSession?: (sessionId: string, clinicalData: ClinicalSessionData, techniquesSummary: string) => Promise<void>;
 }
 
-export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physio, activePatient, activeEpisode, episodes = [], onSelectEpisode, onCreateEpisode, onNewValoracion, onUpdateEpisode, onSaveClinicalSession }: ExpedienteScreenProps) {
+export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physio, geminiConfig, activePatient, activeEpisode, episodes = [], onSelectEpisode, onCreateEpisode, onNewValoracion, onUpdateEpisode, onSaveClinicalSession }: ExpedienteScreenProps) {
   const [modalOpen, setModalOpen] = useState(false);
   const [reportSession, setReportSession] = useState<SessionEntry | null>(null);
   const [episodeCreateError, setEpisodeCreateError] = useState<string | null>(null);
+  const [officialReportOpen, setOfficialReportOpen] = useState(false);
 
   const startNewEpisode = async () => {
     setEpisodeCreateError(null);
@@ -48,17 +51,79 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
     }
   };
 
-  const chartData = sessions.map((s) => ({
-    date: formatDateShort(s.date),
-    eva: s.eva,
-    fullDate: s.date,
-  }));
-
-  const firstEva = sessions[0]?.eva || 0;
-  const lastEva = sessions[sessions.length - 1]?.eva || 0;
-  const globalImprovement = sessions.length > 1
-    ? Math.round(((firstEva - lastEva) / firstEva) * 100)
+  const chronologicalSessions = [...sessions].sort((a, b) => a.date.localeCompare(b.date));
+  const latestComparableSession = [...chronologicalSessions].reverse().find((session) =>
+    Boolean(session.clinicalData?.comparable?.parameter),
+  ) ?? chronologicalSessions[chronologicalSessions.length - 1];
+  const activeParameter = getSessionParameter(latestComparableSession);
+  const activeForceMode = activeParameter === 'force'
+    ? latestComparableSession?.clinicalData?.comparable?.forceMode
+    : null;
+  const chartSessions = chronologicalSessions.filter((session) =>
+    getSessionParameter(session) === activeParameter
+    && (activeParameter !== 'force' || session.clinicalData?.comparable?.forceMode === activeForceMode),
+  );
+  const chartData = chartSessions.map((session) => getChartValues(session, activeParameter));
+  const firstSessionValues = chartData[0];
+  const lastSessionValues = chartData[chartData.length - 1];
+  const startValue = firstSessionValues?.pre ?? firstSessionValues?.post ?? 0;
+  const endValue = lastSessionValues?.post ?? lastSessionValues?.pre ?? 0;
+  const hasNumericChartData = chartData.some((point) => point.pre !== null || point.post !== null);
+  const globalImprovement = chartData.length > 1 && startValue !== 0
+    ? Math.round((activeParameter === 'eva'
+      ? (startValue - endValue) / startValue
+      : (endValue - startValue) / startValue) * 100)
     : 0;
+  const lastEva = sessions[sessions.length - 1]?.clinicalData?.comparable?.evaCurrent
+    ?? sessions[sessions.length - 1]?.clinicalData?.comparable?.eva
+    ?? sessions[sessions.length - 1]?.eva
+    ?? 0;
+  const sortedEpisodes = [...episodes].sort((a, b) => {
+    const activeDifference = Number(isEpisodeActive(b)) - Number(isEpisodeActive(a));
+    if (activeDifference !== 0) return activeDifference;
+    return getLatestEpisodeActivity(b, sessions) - getLatestEpisodeActivity(a, sessions);
+  });
+  const activeEpisodes = sortedEpisodes.filter(isEpisodeActive);
+  const closedEpisodes = sortedEpisodes.filter((episode) => !isEpisodeActive(episode));
+
+  const renderEpisode = (ep: Episode, isActive: boolean) => {
+    const firstSessionRegion = [...sessions]
+      .filter((session) => session.episodeId === ep.id)
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .find((session) => session.clinicalData?.region)?.clinicalData?.region;
+    const regionLabel = BODY_REGIONS.find((item) => item.key === ep.region)?.label ?? ep.region;
+    const isPlaceholderTitle = /^(nueva valoración|nuevo episodio)$/i.test(ep.title.trim());
+    const displayTitle = isPlaceholderTitle ? firstSessionRegion || regionLabel || ep.title : ep.title;
+    return (
+      <div
+        key={ep.id}
+        className={`flex flex-wrap items-center gap-1 rounded-lg border p-1 ${
+          isActive ? 'border-success-200 bg-white' : 'border-slate-200 bg-slate-50'
+        }`}
+      >
+        <button
+          type="button"
+          onClick={() => onSelectEpisode?.(ep.id)}
+          className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-all ${
+            activeEpisode?.id === ep.id
+              ? 'bg-primary-600 text-white'
+              : isActive ? 'text-slate-700 hover:bg-success-50' : 'text-slate-500 hover:bg-slate-100'
+          }`}
+        >
+          {displayTitle}
+          {regionLabel && normalizeText(displayTitle) !== normalizeText(regionLabel) && (
+            <span className={`rounded px-1.5 py-0.5 text-[10px] ${
+              activeEpisode?.id === ep.id ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-400'
+            }`}>
+              {regionLabel}
+            </span>
+          )}
+        </button>
+        {isActive && <Badge variant="success">Activo</Badge>}
+        {onUpdateEpisode && <EpisodeStatusControl episode={ep} onUpdate={onUpdateEpisode} />}
+      </div>
+    );
+  };
 
   return (
     <div className="mx-auto max-w-[1400px] space-y-6 px-4 py-6 lg:px-6">
@@ -91,41 +156,27 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
 
           {/* Episode selector */}
           {episodes.length > 0 && onSelectEpisode && (
-            <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-primary-100 pt-3">
-              <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                <Folder className="h-3.5 w-3.5" /> Episodios:
-              </span>
-              {episodes.map((ep) => {
-                const firstSessionRegion = [...sessions]
-                  .filter((session) => session.episodeId === ep.id)
-                  .sort((a, b) => a.date.localeCompare(b.date))
-                  .find((session) => session.clinicalData?.region)?.clinicalData?.region;
-                const regionLabel = BODY_REGIONS.find((item) => item.key === ep.region)?.label ?? ep.region;
-                const isPlaceholderTitle = /^(nueva valoración|nuevo episodio)$/i.test(ep.title.trim());
-                const displayTitle = isPlaceholderTitle ? firstSessionRegion || regionLabel || ep.title : ep.title;
-                return (
-                  <div key={ep.id} className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-200 bg-white p-1">
-                    <button
-                      type="button"
-                      onClick={() => onSelectEpisode(ep.id)}
-                      className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-all ${
-                        activeEpisode?.id === ep.id ? 'bg-primary-600 text-white' : 'text-slate-600 hover:bg-slate-50'
-                      }`}
-                    >
-                      {displayTitle}
-                      {regionLabel && normalizeText(displayTitle) !== normalizeText(regionLabel) && (
-                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${
-                          activeEpisode?.id === ep.id ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-400'
-                        }`}>
-                          {regionLabel}
-                        </span>
-                      )}
-                    </button>
-                    {ep.status === 'active' && <Badge variant="success">Activo</Badge>}
-                    {onUpdateEpisode && <EpisodeStatusControl episode={ep} onUpdate={onUpdateEpisode} />}
+            <div className="mt-4 space-y-4 border-t border-primary-100 pt-3">
+              <section aria-labelledby="active-episodes-heading">
+                <h3 id="active-episodes-heading" className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-success-700">
+                  <Folder className="h-3.5 w-3.5" /> Episodios en Curso (Activos)
+                </h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  {activeEpisodes.length > 0
+                    ? activeEpisodes.map((episode) => renderEpisode(episode, true))
+                    : <p className="text-xs text-slate-400">No hay episodios activos.</p>}
+                </div>
+              </section>
+              {closedEpisodes.length > 0 && (
+                <section aria-labelledby="closed-episodes-heading" className="border-t border-slate-200 pt-3">
+                  <h3 id="closed-episodes-heading" className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    <Folder className="h-3.5 w-3.5" /> Historial de Episodios Finalizados (Alta Clínica)
+                  </h3>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {closedEpisodes.map((episode) => renderEpisode(episode, false))}
                   </div>
-                );
-              })}
+                </section>
+              )}
               {onCreateEpisode && <Button size="sm" variant="outline" onClick={() => void startNewEpisode()}><FolderPlus className="h-3.5 w-3.5" /> + Nuevo Episodio</Button>}
             </div>
           )}
@@ -167,8 +218,10 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
             />
             <StatBox
               icon={<TrendingUp className="h-5 w-5" />}
-              label="Mejoría global"
-              value={`${globalImprovement}%`}
+              label={activeParameter === 'eva' ? 'Mejoría global (EVA)' : 'Cambio del parámetro'}
+              value={activeParameter === 'paresthesias'
+                ? 'Cualitativo'
+                : hasNumericChartData ? `${globalImprovement}%` : 'Sin datos'}
               color="success"
             />
             <StatBox
@@ -182,8 +235,10 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
           {/* Evolution Chart */}
           <Card>
             <CardHeader
-              title="Evolución del Signo Comparable (EVA)"
-              description="Gráfica interactiva de la evolución del dolor por sesión"
+              title={getChartTitle(activeParameter)}
+              description={activeParameter === 'paresthesias'
+                ? 'Evolución cualitativa del signo comparable'
+                : 'Gráfica de la evolución del signo comparable por sesión'}
               icon={<TrendingUp className="h-5 w-5" />}
               action={
                 <Button size="sm" onClick={() => setModalOpen(true)}>
@@ -192,24 +247,37 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
               }
             />
             <div className="p-5">
+              {activeParameter === 'paresthesias' ? (
+                <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-5 text-sm text-amber-900">
+                  Parámetro cualitativo (Aparición de parestesias) — Consultar evolución detallada en la línea de tiempo
+                </p>
+              ) : (
+                <>
               <div className="mb-4 flex flex-wrap items-center gap-4">
                 <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-full bg-error-500" />
-                  <span className="text-xs text-slate-600">EVA (0–10)</span>
+                  <div className="h-3 w-3 rounded-full bg-primary-600" />
+                  <span className="text-xs text-slate-600">{getChartSeriesLabel(activeParameter)} inicial</span>
                 </div>
-                <Badge variant="success">
-                  Mejoría del {globalImprovement}% — de EVA {firstEva} a EVA {lastEva}
-                </Badge>
+                {chartData.some((point) => point.post !== null) && (
+                  <div className="flex items-center gap-2">
+                    <div className="h-3 w-3 rounded-full bg-emerald-500" />
+                    <span className="text-xs text-slate-600">{getChartSeriesLabel(activeParameter)} final</span>
+                  </div>
+                )}
+                {chartData.length > 1 && hasNumericChartData && (
+                  <Badge variant="success">
+                    Cambio: {formatMetricValue(startValue, activeParameter, activeForceMode)} → {formatMetricValue(endValue, activeParameter, activeForceMode)}
+                  </Badge>
+                )}
               </div>
+              {!hasNumericChartData ? (
+                <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+                  No hay mediciones numéricas registradas para este parámetro.
+                </p>
+              ) : (
               <div className="h-[300px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <ComposedChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: -10 }}>
-                    <defs>
-                      <linearGradient id="evaGradient" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#ef4444" stopOpacity={0.15} />
-                        <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                     <XAxis
                       dataKey="date"
@@ -218,17 +286,21 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
                     />
                     <YAxis
                       yAxisId="left"
-                      domain={[0, 10]}
+                      domain={activeParameter === 'rom' ? [0, 180] : activeParameter === 'eva' ? [0, 10] : activeForceMode === 'daniels' ? [0, 5] : ['auto', 'auto']}
                       tick={{ fontSize: 12, fill: '#64748b' }}
                       axisLine={{ stroke: '#cbd5e1' }}
                       label={{
-                        value: 'EVA',
+                        value: getYAxisLabel(activeParameter, activeForceMode),
                         angle: -90,
                         position: 'insideLeft',
                         style: { fontSize: 11, fill: '#94a3b8' },
                       }}
                     />
                     <Tooltip
+                      formatter={(value, name) => [
+                        typeof value === 'number' ? formatMetricValue(value, activeParameter, activeForceMode) : 'Sin registro',
+                        String(name),
+                      ]}
                       contentStyle={{
                         borderRadius: '12px',
                         border: '1px solid #e2e8f0',
@@ -237,20 +309,33 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
                       labelStyle={{ fontWeight: 600, color: '#1e293b' }}
                     />
                     <ReferenceLine y={0} yAxisId="left" stroke="#cbd5e1" />
-                    <Area
+                    <Line
                       yAxisId="left"
                       type="monotone"
-                      dataKey="eva"
-                      stroke="#ef4444"
+                      dataKey="pre"
+                      stroke="#4f46e5"
                       strokeWidth={2.5}
-                      fill="url(#evaGradient)"
-                      dot={{ r: 5, fill: '#ef4444' }}
+                      dot={{ r: 5, fill: '#4f46e5' }}
                       activeDot={{ r: 7 }}
-                      name="EVA"
+                      name={`${getChartSeriesLabel(activeParameter)} inicial`}
+                    />
+                    <Line
+                      yAxisId="left"
+                      type="monotone"
+                      dataKey="post"
+                      stroke="#10b981"
+                      strokeWidth={2.5}
+                      dot={{ r: 5, fill: '#10b981' }}
+                      activeDot={{ r: 7 }}
+                      connectNulls={false}
+                      name={`${getChartSeriesLabel(activeParameter)} final`}
                     />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
+              )}
+                </>
+              )}
             </div>
           </Card>
 
@@ -260,6 +345,15 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
               title="Línea de Tiempo de Sesiones (Evolutivos)"
               description="Historial cronológico — clic en la tarjeta para desplegar detalles"
               icon={<ClipboardList className="h-5 w-5" />}
+              action={
+                <Button
+                  size="sm"
+                  onClick={() => setOfficialReportOpen(true)}
+                  className="bg-emerald-600 text-white hover:bg-emerald-700"
+                >
+                  <FileText className="h-4 w-4" /> Generar Informe Clínico
+                </Button>
+              }
             />
             <div className="p-5">
               <div className="relative space-y-5 before:absolute before:left-[19px] before:top-2 before:h-[calc(100%-1rem)] before:w-0.5 before:bg-slate-200">
@@ -292,6 +386,15 @@ export function ExpedienteScreen({ sessions = [], onAddSession, equipment, physi
         onClose={() => setReportSession(null)}
         onSave={onSaveClinicalSession}
       />
+      <OfficialReportModal
+        open={officialReportOpen}
+        onClose={() => setOfficialReportOpen(false)}
+        sessions={sessions}
+        patient={activePatient ?? null}
+        episode={activeEpisode ?? null}
+        physio={physio}
+        geminiConfig={geminiConfig}
+      />
     </div>
   );
 }
@@ -305,6 +408,17 @@ function SessionTimelineEntry({
 }) {
   const [expanded, setExpanded] = useState(false);
   const cd = session.clinicalData;
+  const displayTreatment = session.treatmentSummary
+    || session.techniquesSummary
+    || session.shortTreatment
+    || session.manualTreatment
+    || session.treatmentPlan
+    || cd?.techniquesSummary
+    || cd?.report?.treatmentPlan
+    || cd?.manualTreatmentPlan
+    || cd?.aiTreatment;
+  const sessionParameter = getSessionParameter(session);
+  const metricBadge = getSessionMetricBadge(session, sessionParameter);
 
   return (
     <div className="relative flex gap-4 pl-0">
@@ -331,20 +445,8 @@ function SessionTimelineEntry({
               <ChevronDown className={`h-4 w-4 text-slate-400 transition-transform ${expanded ? 'rotate-180' : ''}`} />
             </div>
             <div className="flex items-center gap-2">
-              {session.evaPost !== null && session.evaPost !== undefined ? (
-                <div className="flex items-center gap-1.5 rounded-lg bg-error-50 px-3 py-1">
-                  <span className="text-xs font-medium text-error-600">EVA</span>
-                  <span className="text-sm font-bold text-error-700">{session.eva}/10</span>
-                  <span className="text-xs text-slate-400">➔</span>
-                  <span className="text-sm font-bold text-success-700">{session.evaPost}/10</span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1.5 rounded-lg bg-error-50 px-3 py-1">
-                  <span className="text-xs font-medium text-error-600">EVA</span>
-                  <span className="text-sm font-bold text-error-700">{session.eva}/10</span>
-                </div>
-              )}
-              {session.improvement > 0 && (
+              {metricBadge}
+              {sessionParameter === 'eva' && session.improvement > 0 && (
                 <div className="flex items-center gap-1.5 rounded-lg bg-success-50 px-3 py-1">
                   <TrendingUp className="h-3.5 w-3.5 text-success-600" />
                   <span className="text-sm font-bold text-success-700">+{session.improvement}%</span>
@@ -352,10 +454,10 @@ function SessionTimelineEntry({
               )}
             </div>
           </div>
-          {session.techniquesSummary && (
-            <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-secondary-200 bg-secondary-50 px-3 py-2">
-              <Activity className="h-3.5 w-3.5 shrink-0 text-secondary-600" />
-              <span className="text-xs font-semibold text-secondary-800">{session.techniquesSummary}</span>
+          {displayTreatment && (
+            <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50/60 px-3 py-2">
+              <Activity className="h-3.5 w-3.5 shrink-0 text-blue-600" />
+              <span className="whitespace-pre-wrap text-left text-xs font-semibold text-blue-800">{displayTreatment}</span>
             </div>
           )}
         </button>
@@ -412,6 +514,142 @@ function SessionTimelineEntry({
           </Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function getLatestEpisodeActivity(episode: Episode, sessions: SessionEntry[]): number {
+  const activityDates = [
+    episode.createdAt,
+    episode.updatedAt,
+    episode.latestSessionAt,
+    ...sessions
+      .filter((session) => session.episodeId === episode.id)
+      .map((session) => session.date),
+  ];
+  return activityDates.reduce((latest, value) => {
+    if (!value) return latest;
+    const timestamp = new Date(value).getTime();
+    return Number.isNaN(timestamp) ? latest : Math.max(latest, timestamp);
+  }, 0);
+}
+
+type SessionParameter = 'eva' | 'rom' | 'force' | 'paresthesias';
+
+function getSessionParameter(session?: SessionEntry): SessionParameter {
+  const parameter = normalizeText(session?.clinicalData?.comparable?.parameter ?? '');
+  if (parameter.includes('parestesia')) return 'paresthesias';
+  if (parameter.includes('fuerza') || parameter.includes('inhibicion')) return 'force';
+  if (parameter.includes('rom') || parameter.includes('rango articular')) return 'rom';
+  return 'eva';
+}
+
+function getNumericValue(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = typeof value === 'number' ? value : Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getChartValues(session: SessionEntry, parameter: SessionParameter) {
+  const comparable = session.clinicalData?.comparable;
+  let pre: number | null;
+  let post: number | null;
+
+  if (parameter === 'rom') {
+    pre = getNumericValue(comparable?.rom);
+    post = getNumericValue(comparable?.romPost);
+  } else if (parameter === 'force') {
+    pre = comparable?.forceMode === 'daniels'
+      ? getNumericValue(comparable.forceGrade)
+      : getNumericValue(comparable?.forceKg);
+    post = comparable?.forceMode === 'daniels'
+      ? getNumericValue(comparable.forceGradePost)
+      : getNumericValue(comparable?.forceKgPost);
+  } else {
+    pre = getNumericValue(comparable?.evaCurrent ?? comparable?.eva) ?? getNumericValue(session.eva);
+    post = getNumericValue(comparable?.evaPost ?? session.evaPost);
+  }
+
+  return {
+    date: formatDateShort(session.date),
+    fullDate: session.date,
+    pre,
+    post,
+  };
+}
+
+function getChartTitle(parameter: SessionParameter): string {
+  if (parameter === 'rom') return 'Evolución Rango Articular (°)';
+  if (parameter === 'force') return 'Evolución de Fuerza';
+  if (parameter === 'paresthesias') return 'Evolución de Parestesias';
+  return 'Evolución del Signo Comparable (EVA)';
+}
+
+function getChartSeriesLabel(parameter: SessionParameter): string {
+  if (parameter === 'rom') return 'ROM';
+  if (parameter === 'force') return 'Fuerza';
+  return 'EVA';
+}
+
+function getYAxisLabel(parameter: SessionParameter, forceMode?: 'daniels' | 'dinamometro' | null): string {
+  if (parameter === 'rom') return 'Grados (°)';
+  if (parameter === 'force') return forceMode === 'daniels' ? 'Fuerza (/5)' : 'Fuerza (kg)';
+  return 'EVA';
+}
+
+function formatMetricValue(value: number, parameter: SessionParameter, forceMode?: 'daniels' | 'dinamometro' | null): string {
+  if (parameter === 'rom') return `${value}°`;
+  if (parameter === 'force') return forceMode === 'daniels' ? `${value}/5` : `${value} kg`;
+  return `${value}/10`;
+}
+
+function getSessionMetricBadge(session: SessionEntry, parameter: SessionParameter) {
+  const comparable = session.clinicalData?.comparable;
+  if (parameter === 'paresthesias') {
+    return (
+      <div className="rounded-lg bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
+        Test de Parestesias
+      </div>
+    );
+  }
+  if (parameter === 'rom') {
+    const pre = getNumericValue(comparable?.rom);
+    const post = getNumericValue(comparable?.romPost);
+    return (
+      <div className="flex items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1">
+        <span className="text-sm font-bold text-blue-800">
+          ROM {pre === null ? '—' : `${pre}°`}
+          {post !== null && ` → ${post}° (${post - (pre ?? post) >= 0 ? '+' : ''}${post - (pre ?? post)}°)`}
+        </span>
+      </div>
+    );
+  }
+  if (parameter === 'force') {
+    const isDaniels = comparable?.forceMode === 'daniels';
+    const pre = getNumericValue(isDaniels ? comparable?.forceGrade : comparable?.forceKg);
+    const post = getNumericValue(isDaniels ? comparable?.forceGradePost : comparable?.forceKgPost);
+    const unit = isDaniels ? '/5' : ' kg';
+    return (
+      <div className="flex items-center gap-1.5 rounded-lg bg-blue-50 px-3 py-1">
+        <span className="text-sm font-bold text-blue-800">
+          Fuerza {pre === null ? '—' : `${pre}${unit}`}
+          {post !== null && ` → ${post}${unit}`}
+        </span>
+      </div>
+    );
+  }
+  const pre = getNumericValue(comparable?.evaCurrent ?? comparable?.eva) ?? getNumericValue(session.eva) ?? 0;
+  const post = getNumericValue(comparable?.evaPost ?? session.evaPost);
+  return (
+    <div className="flex items-center gap-1.5 rounded-lg bg-error-50 px-3 py-1">
+      <span className="text-xs font-medium text-error-600">EVA</span>
+      <span className="text-sm font-bold text-error-700">{pre}/10</span>
+      {post !== null && (
+        <>
+          <span className="text-xs text-slate-400">→</span>
+          <span className="text-sm font-bold text-success-700">{post}/10</span>
+        </>
+      )}
     </div>
   );
 }
@@ -1057,6 +1295,585 @@ function AddSessionModal({
           />
         </div>
       </div>
+    </Modal>
+  );
+}
+
+interface OfficialReportSettings {
+  physiotherapist: string;
+  registrationNumber: string;
+  clinicName: string;
+  clinicDetails: string;
+  recipient: string;
+  finalNotes: string;
+}
+
+const OFFICIAL_REPORT_SETTINGS_KEY = 'fisiocopilot_official_report_settings';
+
+function readOfficialReportSettings(defaultPhysio: string): OfficialReportSettings {
+  const defaults: OfficialReportSettings = {
+    physiotherapist: defaultPhysio.replace(/^Fisio:\s*/i, ''),
+    registrationNumber: '',
+    clinicName: '',
+    clinicDetails: '',
+    recipient: 'Médico Traumatólogo / Especialista',
+    finalNotes: '',
+  };
+  try {
+    const stored = localStorage.getItem(OFFICIAL_REPORT_SETTINGS_KEY);
+    if (!stored) return defaults;
+    const parsed: Partial<OfficialReportSettings> = JSON.parse(stored);
+    const storedText = (key: keyof OfficialReportSettings) => {
+      const value = parsed?.[key];
+      return typeof value === 'string' ? value : defaults[key];
+    };
+    return {
+      physiotherapist: storedText('physiotherapist'),
+      registrationNumber: storedText('registrationNumber'),
+      clinicName: storedText('clinicName'),
+      clinicDetails: storedText('clinicDetails'),
+      recipient: storedText('recipient'),
+      finalNotes: storedText('finalNotes'),
+    };
+  } catch (error) {
+    console.error('No se pudo leer la configuración del informe clínico:', error);
+    return defaults;
+  }
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character] ?? character);
+}
+
+interface OfficialReportSection {
+  title: string;
+  content: string;
+}
+
+const OFFICIAL_REPORT_SECTION_TITLES = [
+  'MOTIVO DE CONSULTA Y ANAMNESIS EVOLUTIVA',
+  'VALORACIÓN FÍSICA, CRIBADO Y PRUEBAS COMPLEMENTARIAS',
+  'JUICIO CLÍNICO FISIOTERÁPICO',
+  'INTERVENCIÓN FISIOTERÁPICA REALIZADA (RESUMEN DE SESIONES)',
+  'EVOLUCIÓN OBJETIVA Y SIGNO COMPARABLE (TEST-RETEST)',
+  'CONCLUSIONES Y RECOMENDACIONES CLÍNICAS',
+];
+
+function extractReportText(raw: string): string {
+  const cleanText = (text: string) => text
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\n')
+    .replace(/```(?:json|text)?/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  const textFields = ['cuerpo_informe', 'cuerpoInforme', 'reportBody', 'body', 'report', 'content', 'informe', 'text'];
+  let candidate: unknown = raw.trim();
+
+  for (let attempt = 0; attempt < 3 && typeof candidate === 'string'; attempt += 1) {
+    const text = candidate.replace(/```(?:json|text)?/gi, '').replace(/```/g, '').trim();
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed === 'string') {
+        candidate = parsed;
+        continue;
+      }
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const record = parsed as Record<string, unknown>;
+        const field = textFields.find((key) => typeof record[key] === 'string')
+          ?? Object.keys(record).find((key) => typeof record[key] === 'string');
+        if (field) {
+          candidate = record[field];
+          continue;
+        }
+      }
+      candidate = text;
+      break;
+    } catch {
+      candidate = cleanText(text);
+      break;
+    }
+  }
+
+  if (typeof candidate !== 'string') {
+    throw new Error('Gemini devolvió un formato de informe que no se pudo interpretar.');
+  }
+  return cleanText(candidate)
+    .replace(/^\s*(?:#{1,6}\s*)?INFORME CLÍNICO FISIOTERÁPICO\s*\n?/i, '')
+    .replace(/^\s*(?:1[).]\s*)?ENCABEZADO PROFESIONAL[\s\S]*?(?=^(?:#{1,6}\s*)?(?:MOTIVO DE CONSULTA|2[).]\s*MOTIVO DE CONSULTA)\b)/im, '')
+    .replace(/^\s*(?:Firma|Fdo\.?):[\s\S]*$/im, '')
+    .replace(/^\s*(?:Fisioterapeuta Col\.?\s*Nº|Nº de colegiado|Clínica)\s*:.*$/gim, '')
+    .trim();
+}
+
+function parseOfficialReportSections(reportText: string): OfficialReportSection[] {
+  const sections: OfficialReportSection[] = [];
+  let currentSection: OfficialReportSection | null = null;
+  const normalizeHeading = (line: string) => line
+    .replace(/\*\*/g, '')
+    .replace(/^\s*#{1,6}\s*/, '')
+    .replace(/^\s*\d+[).]\s*/, '')
+    .replace(/:$/, '')
+    .trim()
+    .toLocaleUpperCase('es');
+
+  for (const line of reportText.split(/\r?\n/)) {
+    const normalizedLine = normalizeHeading(line);
+    const matchedTitle = OFFICIAL_REPORT_SECTION_TITLES.find((title) =>
+      normalizedLine === title || normalizedLine.startsWith(`${title}:`),
+    );
+    if (matchedTitle) {
+      const originalHeading = line
+        .replace(/\*\*/g, '')
+        .replace(/^\s*#{1,6}\s*/, '')
+        .replace(/^\s*\d+[).]\s*/, '')
+        .trim();
+      const headingContent = originalHeading.toLocaleUpperCase('es').startsWith(`${matchedTitle}:`)
+        ? originalHeading.slice(matchedTitle.length + 1).trim()
+        : '';
+      currentSection = { title: matchedTitle, content: headingContent };
+      sections.push(currentSection);
+    } else if (currentSection) {
+      currentSection.content = currentSection.content
+        ? `${currentSection.content}\n${line}`
+        : line;
+    } else if (line.trim()) {
+      currentSection = { title: OFFICIAL_REPORT_SECTION_TITLES[0], content: line };
+      sections.push(currentSection);
+    }
+  }
+
+  if (sections.length === 0 && reportText.trim()) {
+    sections.push({ title: OFFICIAL_REPORT_SECTION_TITLES[0], content: reportText.trim() });
+  }
+  const sectionContentByTitle = new Map<string, string>();
+  for (const section of sections) {
+    const existing = sectionContentByTitle.get(section.title);
+    sectionContentByTitle.set(
+      section.title,
+      [existing, section.content.trim()].filter(Boolean).join('\n\n'),
+    );
+  }
+  return OFFICIAL_REPORT_SECTION_TITLES.map((title) => ({
+    title,
+    content: sectionContentByTitle.get(title) ?? '',
+  }));
+}
+
+function OfficialReportModal({
+  open,
+  onClose,
+  sessions,
+  patient,
+  episode,
+  physio,
+  geminiConfig,
+}: {
+  open: boolean;
+  onClose: () => void;
+  sessions: SessionEntry[];
+  patient: Patient | null;
+  episode: Episode | null;
+  physio: string;
+  geminiConfig: GeminiConfig;
+}) {
+  const [settings, setSettings] = useState<OfficialReportSettings>(() => readOfficialReportSettings(physio));
+  const [reportSections, setReportSections] = useState<OfficialReportSection[]>([]);
+  const [reportIssueDate, setReportIssueDate] = useState('');
+  const [isPreview, setIsPreview] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const hasApiKey = Boolean(geminiConfig.apiKey.trim() || import.meta.env.VITE_GEMINI_API_KEY?.trim());
+
+  useEffect(() => {
+    if (!open) return;
+    setSettings((current) => ({
+      ...current,
+      physiotherapist: physio.replace(/^Fisio:\s*/i, ''),
+    }));
+    setError(null);
+  }, [open, physio]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OFFICIAL_REPORT_SETTINGS_KEY, JSON.stringify(settings));
+    } catch (storageError) {
+      console.error('No se pudo guardar la configuración del informe clínico:', storageError);
+    }
+  }, [settings]);
+
+  const updateSetting = (key: keyof OfficialReportSettings, value: string) => {
+    setSettings((current) => ({ ...current, [key]: value }));
+  };
+
+  const createReport = async () => {
+    if (!hasApiKey) {
+      setError('Configura la API key de Gemini en Ajustes para generar el informe.');
+      return;
+    }
+    if (sessions.length === 0) {
+      setError('Este episodio aún no tiene sesiones clínicas registradas.');
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setCopied(false);
+    try {
+      const issueDate = new Date().toISOString().slice(0, 10);
+      const clinicalSessions = [...sessions]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .map((session) => {
+          const clinicalData = session.clinicalData;
+          const comparable = clinicalData?.comparable;
+          const primaryHypothesis = clinicalData?.hypotheses?.find((hypothesis) => hypothesis.isPrimary);
+          const treatment = session.treatmentSummary
+            || session.shortTreatment
+            || session.treatmentPlan
+            || session.manualTreatment
+            || session.techniquesSummary
+            || clinicalData?.techniquesSummary
+            || clinicalData?.report?.treatmentPlan
+            || clinicalData?.manualTreatmentPlan
+            || clinicalData?.aiTreatment
+            || session.techniques?.join(' | ')
+            || 'No registrado';
+          return {
+            sessionNumber: 0,
+            date: session.date,
+            physiotherapist: session.physio,
+            reasonAndAnamnesis: clinicalData?.anamnesis ?? session.summary,
+            region: clinicalData?.region ?? episode?.region ?? 'No especificada',
+            diagnosis: clinicalData?.manualClinicalDiagnosis
+              || clinicalData?.report?.clinicalDiagnosis
+              || (primaryHypothesis
+                ? `${primaryHypothesis.label}${primaryHypothesis.justification ? `: ${primaryHypothesis.justification}` : ''}`
+                : 'No registrado'),
+            differentialHypotheses: (clinicalData?.hypotheses ?? [])
+              .filter((hypothesis) => !hypothesis.isPrimary)
+              .map((hypothesis) => ({
+                name: hypothesis.label,
+                reasoning: hypothesis.justification,
+              })),
+            interviewFindings: (clinicalData?.dichotomousFindings ?? []).map((finding) => ({
+              question: finding.label,
+              answer: finding.answer,
+              note: finding.note,
+            })),
+            orthopedicTests: (clinicalData?.tests ?? []).map((test) => ({
+              name: test.name,
+              region: test.region,
+              description: test.description,
+              position: test.position,
+              maneuver: test.maneuver,
+              positiveCriteria: test.positiveCriteria,
+              result: test.result || 'Sin valorar',
+            })),
+            redFlags: (clinicalData?.redFlags ?? []).map((flag) => ({
+              label: flag.label,
+              status: flag.status,
+            })),
+            yellowFlags: (clinicalData?.yellowFlags ?? []).filter((flag) => flag.checked).map((flag) => flag.label),
+            ultrasound: clinicalData?.manualSonoFindings
+              || (clinicalData?.sonoFindings ?? []).map((finding) =>
+                `${finding.structure}: ${finding.findings.join(', ')}${finding.notes ? ` (${finding.notes})` : ''}`,
+              ).join('; ')
+              || 'No registrado',
+            complementaryTests: clinicalData?.complementary || 'No registrado',
+            physicalExploration: clinicalData?.freeExploration || 'No registrada',
+            treatment,
+            sessionNotes: session.summary,
+            retest: session.retest,
+            comparable: comparable ? {
+              movement: comparable.movement,
+              parameter: comparable.parameter,
+              evaPre: comparable.evaCurrent ?? comparable.eva,
+              evaPost: comparable.evaPost,
+              romPre: comparable.rom,
+              romPost: comparable.romPost,
+              forceMode: comparable.forceMode,
+              forcePre: comparable.forceMode === 'daniels' ? comparable.forceGrade : comparable.forceKg,
+              forcePost: comparable.forceMode === 'daniels' ? comparable.forceGradePost : comparable.forceKgPost,
+              instructions: comparable.instructions,
+            } : null,
+            evolution: clinicalData?.evolution ?? null,
+            equipmentSafety: clinicalData?.equipmentSafety ?? [],
+          };
+        });
+      clinicalSessions.forEach((session, index) => {
+        session.sessionNumber = index + 1;
+      });
+      const firstComparable = clinicalSessions.find((session) => session.comparable)?.comparable ?? null;
+      const lastComparable = [...clinicalSessions].reverse().find((session) => session.comparable)?.comparable ?? null;
+      const sessionDateRange = clinicalSessions.length > 0
+        ? `${formatDate(clinicalSessions[0].date)} y ${formatDate(clinicalSessions[clinicalSessions.length - 1].date)}`
+        : 'sin fechas registradas';
+      const clinicalTimelineSummary = `${clinicalSessions.length} sesiones realizadas entre ${sessionDateRange}`;
+      const overallObjectiveProgress = firstComparable && lastComparable
+        ? {
+            movement: firstComparable.movement,
+            parameter: firstComparable.parameter,
+            initialSession: firstComparable,
+            latestSession: lastComparable,
+          }
+        : null;
+      const patientData = {
+        name: patient?.name || 'No especificado',
+        dateOfBirth: patient?.birthDate || 'No registrada',
+      };
+      const episodeData = {
+        title: episode?.title || 'No especificado',
+        region: episode?.region || 'No especificada',
+        anamnesis: episode?.anamnesis ?? null,
+      };
+      const prompt = `Actúa como redactor de un informe clínico fisioterápico profesional de derivación. Redacta en español, con tono clínico objetivo, claro y conciso. Utiliza exclusivamente los datos recibidos: no inventes diagnósticos, hallazgos, resultados negativos, causalidad, pronóstico ni recomendaciones. Distingue claramente entre dato no registrado, test sin valorar y hallazgo descartado. Integra cronológicamente las sesiones y conserva los valores medidos tal como aparecen.
+
+Genera el informe clínico completo en seis secciones con estos títulos exactos, en mayúsculas y cada título en una línea independiente:
+MOTIVO DE CONSULTA Y ANAMNESIS EVOLUTIVA: cronología de los síntomas iniciales, mecanismo desencadenante y evolución subjetiva a lo largo de las sesiones.
+VALORACIÓN FÍSICA, CRIBADO Y PRUEBAS COMPLEMENTARIAS: exploración funcional, tests ortopédicos con sus resultados reales, banderas rojas descartadas solo cuando el estado figure como descartado, y ecografía/pruebas complementarias si constan.
+JUICIO CLÍNICO FISIOTERÁPICO: diagnóstico fisioterápico principal manual o hipótesis principal registrada con el razonamiento documentado. No formules diagnósticos nuevos.
+INTERVENCIÓN FISIOTERÁPICA REALIZADA (RESUMEN DE SESIONES): indica el total y sintetiza con concisión las técnicas realmente aplicadas por sesión, incluidas dosis cuando consten.
+EVOLUCIÓN OBJETIVA Y SIGNO COMPARABLE (TEST-RETEST): identifica el Signo Asterisco y compara la medición basal de la primera sesión con la última disponible para el mismo parámetro (EVA, ROM en grados, fuerza o parestesias). Conserva unidades; no conviertas valores ausentes en cero.
+CONCLUSIONES Y RECOMENDACIONES CLÍNICAS: describe la situación actual respaldada por los datos y el motivo de derivación. No inventes recomendaciones de autotratamiento ni seguimiento no indicadas explícitamente en los datos.
+
+No escribas JSON, bloques de código, un encabezado institucional ni una firma: la aplicación ya los presentará mediante la plantilla del documento. No numeres las secciones. No omitas ninguna de las seis secciones. No añadas un séptimo apartado.
+
+Datos del paciente: ${JSON.stringify(patientData)}
+Episodio: ${JSON.stringify(episodeData)}
+${clinicalTimelineSummary}.
+Progresión global del Signo Asterisco desde la primera sesión hasta la última: ${JSON.stringify(overallObjectiveProgress)}
+Datos reales de cada sesión en orden cronológico (incluye anamnesis, exploración, banderas, tests, tratamiento, retest y evolución): ${JSON.stringify(clinicalSessions)}
+Motivo u observaciones del fisioterapeuta: ${settings.finalNotes || 'No indicado'}
+Destinatario: ${settings.recipient}
+Fecha de emisión: ${formatDate(issueDate)}
+
+Devuelve únicamente el texto clínico de las seis secciones; sin encabezado profesional ni firma.`;
+      const rawBody = await callGemini(prompt, geminiConfig, { timeoutMs: 90000, maxOutputTokens: 4096 });
+      const body = extractReportText(rawBody);
+      setReportSections(parseOfficialReportSections(body));
+      setReportIssueDate(issueDate);
+      setIsPreview(true);
+    } catch (generationError) {
+      console.error('No se pudo generar el informe clínico:', generationError);
+      setError(generationError instanceof Error ? generationError.message : 'No se pudo generar el informe clínico.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copyReport = async () => {
+    try {
+      const sortedSessions = [...sessions].sort((a, b) => a.date.localeCompare(b.date));
+      const plainText = [
+        'INFORME CLÍNICO FISIOTERÁPICO',
+        settings.clinicName,
+        settings.clinicDetails,
+        `Fisioterapeuta: ${settings.physiotherapist}`,
+        `Nº de colegiado: ${settings.registrationNumber}`,
+        `Fecha de emisión: ${formatDate(reportIssueDate)}`,
+        `Dirigido a: ${settings.recipient}`,
+        '',
+        `Paciente: ${patient?.name || 'No especificado'}`,
+        `Fecha de nacimiento: ${patient?.birthDate ? formatDate(patient.birthDate) : 'No registrada'}`,
+        `Inicio del episodio: ${episode?.createdAt ? formatDate(episode.createdAt.slice(0, 10)) : 'No registrado'}`,
+        `Sesiones realizadas: ${sortedSessions.length}`,
+        '',
+        ...reportSections.flatMap((section) => [section.title, section.content, '']),
+        `Fdo.: ${settings.physiotherapist}`,
+        `Fisioterapeuta Col. Nº ${settings.registrationNumber}`,
+        settings.clinicName,
+      ].filter((line) => line !== undefined);
+      await navigator.clipboard.writeText(plainText.join('\n'));
+      setCopied(true);
+      setError(null);
+    } catch (copyError) {
+      console.error('No se pudo copiar el informe clínico:', copyError);
+      setError('No se pudo copiar el informe. Comprueba los permisos del portapapeles.');
+    }
+  };
+
+  const printReport = () => {
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+      setError('El navegador ha bloqueado la ventana de impresión. Permite ventanas emergentes e inténtalo de nuevo.');
+      return;
+    }
+    const reportSectionsHtml = reportSections.map((section) => `
+      <section class="report-section">
+        <h2>${escapeHtml(section.title)}</h2>
+        <p>${escapeHtml(section.content).replace(/\r?\n/g, '<br>')}</p>
+      </section>
+    `).join('');
+    printWindow.document.open();
+    printWindow.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Informe clínico</title><style>
+      @page { size: A4; margin: 18mm; }
+      * { box-sizing: border-box; }
+      body { color: #334155; font: 10.5pt/1.55 Arial, sans-serif; margin: 0; }
+      .document { max-width: 174mm; margin: 0 auto; }
+      .institutional-header { display: flex; justify-content: space-between; gap: 24px; padding: 0 0 16px; border-bottom: 3px solid #059669; }
+      .institutional-header h1 { color: #064e3b; font-size: 17pt; margin: 0 0 8px; }
+      .clinic { color: #0f172a; font-size: 14pt; font-weight: 700; margin: 0 0 4px; }
+      .header-right { min-width: 220px; text-align: right; }
+      .header-right p, .institutional-header p { margin: 2px 0; }
+      .patient-data { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; margin: 16px 0; padding: 12px; }
+      .patient-data p { margin: 3px 0; }
+      .report-section { break-inside: avoid; margin: 18px 0 0; }
+      .report-section h2 { border-bottom: 1px solid #cbd5e1; color: #065f46; font-size: 10pt; font-weight: 700; letter-spacing: .04em; margin: 0 0 8px; padding-bottom: 4px; }
+      .report-section p { line-height: 1.6; margin: 0; white-space: pre-line; }
+      .signature { border-top: 1px solid #cbd5e1; display: flex; justify-content: flex-end; margin-top: 40px; padding-top: 24px; text-align: right; }
+      .signature p { margin: 2px 0; }
+    </style></head><body><main class="document">
+      <header class="institutional-header">
+        <div><h1>INFORME CLÍNICO FISIOTERÁPICO</h1><p class="clinic">${escapeHtml(settings.clinicName || 'Clínica / Centro')}</p><p>${escapeHtml(settings.clinicDetails || '')}</p></div>
+        <div class="header-right"><p><strong>Fisioterapeuta:</strong> ${escapeHtml(settings.physiotherapist)}</p><p><strong>Nº de colegiado:</strong> ${escapeHtml(settings.registrationNumber)}</p><p><strong>Fecha:</strong> ${escapeHtml(formatDate(reportIssueDate))}</p><p><strong>Dirigido a:</strong> ${escapeHtml(settings.recipient)}</p></div>
+      </header>
+      <section class="patient-data"><p><strong>Paciente:</strong> ${escapeHtml(patient?.name || 'No especificado')}</p><p><strong>Fecha de nacimiento:</strong> ${escapeHtml(patient?.birthDate ? formatDate(patient.birthDate) : 'No registrada')}</p><p><strong>Inicio del episodio:</strong> ${escapeHtml(episode?.createdAt ? formatDate(episode.createdAt.slice(0, 10)) : 'No registrado')}</p><p><strong>Sesiones realizadas:</strong> ${sessions.length}</p></section>
+      ${reportSectionsHtml}
+      <footer class="signature"><div><p><em>Fdo.: ${escapeHtml(settings.physiotherapist)}</em></p><p>Fisioterapeuta Col. Nº ${escapeHtml(settings.registrationNumber)}</p><p>${escapeHtml(settings.clinicName)}</p></div></footer>
+    </main></body></html>`);
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+  };
+
+  const closeModal = () => {
+    setIsPreview(false);
+    setReportSections([]);
+    setReportIssueDate('');
+    setError(null);
+    onClose();
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={closeModal}
+      title={isPreview ? 'Vista previa del Informe Clínico' : 'Configurar Informe Clínico / Derivación'}
+      subtitle={isPreview ? 'Revisa y edita el informe antes de copiarlo o imprimirlo.' : 'Datos profesionales y destinatario para este informe'}
+      size="xl"
+      footer={isPreview ? (
+        <>
+          <Button variant="ghost" onClick={() => setIsPreview(false)}>Editar configuración</Button>
+          <Button variant="outline" onClick={copyReport}>
+            {copied ? <ClipboardCheck className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+            {copied ? 'Copiado' : 'Copiar texto'}
+          </Button>
+          <Button onClick={printReport}>
+            <Printer className="h-4 w-4" /> Imprimir / Guardar como PDF
+          </Button>
+        </>
+      ) : (
+        <>
+          <Button variant="ghost" onClick={closeModal}>Cancelar</Button>
+          <Button
+            onClick={() => void createReport()}
+            disabled={loading || !hasApiKey || sessions.length === 0}
+            className="bg-emerald-600 text-white hover:bg-emerald-700"
+          >
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+            {loading ? 'Generando informe…' : 'Crear Informe'}
+          </Button>
+        </>
+      )}
+    >
+      {isPreview ? (
+        <article className="mx-auto max-w-4xl rounded-lg bg-white p-4 text-slate-700 sm:p-8">
+          <header className="flex flex-col justify-between gap-5 border-b-[3px] border-emerald-600 pb-4 sm:flex-row">
+            <div>
+              <h1 className="text-xl font-bold tracking-tight text-emerald-900">INFORME CLÍNICO FISIOTERÁPICO</h1>
+              <p className="mt-2 text-lg font-bold text-slate-900">{settings.clinicName || 'Clínica / Centro'}</p>
+              {settings.clinicDetails && <p className="mt-1 whitespace-pre-line text-sm text-slate-600">{settings.clinicDetails}</p>}
+            </div>
+            <div className="text-sm sm:min-w-64 sm:text-right">
+              <p><strong>Fisioterapeuta:</strong> {settings.physiotherapist || 'No especificado'}</p>
+              <p><strong>Nº de colegiado:</strong> {settings.registrationNumber || 'No especificado'}</p>
+              <p><strong>Fecha de emisión:</strong> {reportIssueDate ? formatDate(reportIssueDate) : '—'}</p>
+              <p><strong>Dirigido a:</strong> {settings.recipient}</p>
+            </div>
+          </header>
+          <section className="mb-4 mt-4 grid gap-1 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm sm:grid-cols-2">
+            <p><strong>Paciente:</strong> {patient?.name || 'No especificado'}</p>
+            <p><strong>Fecha de nacimiento:</strong> {patient?.birthDate ? formatDate(patient.birthDate) : 'No registrada'}</p>
+            <p><strong>Inicio del episodio:</strong> {episode?.createdAt ? formatDate(episode.createdAt.slice(0, 10)) : 'No registrado'}</p>
+            <p><strong>Sesiones realizadas:</strong> {sessions.length}</p>
+          </section>
+          {reportSections.map((section, index) => (
+            <section key={`${section.title}-${index}`} className="mb-5 mt-5">
+              <h2 className="mb-2 border-b border-slate-200 pb-1 text-sm font-bold uppercase tracking-wide text-emerald-800">
+                {section.title}
+              </h2>
+              <textarea
+                aria-label={`Contenido: ${section.title}`}
+                value={section.content}
+                onChange={(event) => {
+                  setReportSections((current) => current.map((item, itemIndex) =>
+                    itemIndex === index ? { ...item, content: event.target.value } : item,
+                  ));
+                  setCopied(false);
+                }}
+                rows={Math.max(3, section.content.split('\n').length + 1)}
+                className="w-full resize-y rounded-md border border-transparent bg-transparent px-1 py-1 text-sm leading-relaxed text-slate-700 outline-none hover:border-slate-200 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100"
+              />
+            </section>
+          ))}
+          <footer className="mt-10 flex justify-end border-t border-slate-200 pt-6">
+            <div className="text-right text-sm text-slate-700">
+              <p className="italic">Fdo.: {settings.physiotherapist || 'No especificado'}</p>
+              <p>Fisioterapeuta Col. Nº {settings.registrationNumber || 'No especificado'}</p>
+              <p>{settings.clinicName || 'Clínica / Centro'}</p>
+            </div>
+          </footer>
+        </article>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="text-sm font-medium text-slate-700">
+            Nombre del Fisioterapeuta
+            <input value={settings.physiotherapist} onChange={(event) => updateSetting('physiotherapist', event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          <label className="text-sm font-medium text-slate-700">
+            Nº de Colegiado
+            <input value={settings.registrationNumber} onChange={(event) => updateSetting('registrationNumber', event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          <label className="text-sm font-medium text-slate-700">
+            Nombre de la Clínica / Centro
+            <input value={settings.clinicName} onChange={(event) => updateSetting('clinicName', event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          <label className="text-sm font-medium text-slate-700">
+            Datos adicionales de la Clínica
+            <input value={settings.clinicDetails} onChange={(event) => updateSetting('clinicDetails', event.target.value)} placeholder="Dirección / Teléfono" className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+            Dirigido a
+            <select value={settings.recipient} onChange={(event) => updateSetting('recipient', event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100">
+              <option>Médico Traumatólogo / Especialista</option>
+              <option>Médico de Atención Primaria</option>
+              <option>Otro Fisioterapeuta / Compañero</option>
+              <option>Informe para el Paciente / Aseguradora</option>
+            </select>
+          </label>
+          <label className="text-sm font-medium text-slate-700 sm:col-span-2">
+            Motivo del informe / Observaciones finales
+            <textarea value={settings.finalNotes} onChange={(event) => updateSetting('finalNotes', event.target.value)} rows={3} className="mt-1.5 w-full resize-y rounded-xl border border-slate-200 px-3 py-2.5 font-normal outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100" />
+          </label>
+          {!hasApiKey && (
+            <p className="sm:col-span-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              Configura la API key de Gemini en Ajustes para generar el informe.
+            </p>
+          )}
+          {sessions.length === 0 && (
+            <p className="sm:col-span-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              Este episodio aún no tiene sesiones clínicas registradas.
+            </p>
+          )}
+        </div>
+      )}
+      {error && <p role="alert" className="mt-4 rounded-lg border border-error-200 bg-error-50 px-3 py-2 text-sm text-error-700">{error}</p>}
     </Modal>
   );
 }
